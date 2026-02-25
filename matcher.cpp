@@ -820,6 +820,7 @@ public:
     void add_rule(rule_def r) { rules_.push_back(std::move(r)); }
     void evaluate() { auto ss = stratify(); for (auto& s : ss) eval_stratum(s); }
 
+    mask_t& get_bits(const std::string& n) { return idb(n)->mask; }
     const mask_t& get_bits(const std::string& n) const { return idb(n)->mask; }
 };
 
@@ -1330,6 +1331,91 @@ TEST(Datalog, PureIDBIntersection) {
     EXPECT_TRUE(bt(p.get_bits("C"), 2));
     EXPECT_TRUE(bt(p.get_bits("C"), 3));
     EXPECT_FALSE(bt(p.get_bits("C"), 4));
+}
+
+TEST(GameECS, ComponentFilter) {
+    const size_t entity_count = 128;
+    table entities(entity_count);
+    entities.add_column_u32("level");
+    entities.add_column_f32("health");
+
+    // Setup Entity 42: Level 10, Health 25.5, Tag 3 (Poisoned)
+    entities.get_col("level").u32[42] = 10;
+    entities.get_col("health").f32[42] = 25.5f;
+    entities.set_tag(42, 3); // Bit 3 (value 8)
+
+    // Setup Entity 43: Level 5, Health 25.5, Tag 3 (Poisoned) - Should fail level check
+    entities.get_col("level").u32[43] = 5;
+    entities.get_col("health").f32[43] = 25.5f;
+    entities.set_tag(43, 3);
+
+    using namespace match;
+    // Query: (Level >= 10) AND (Health < 50.0) AND (Has Poison Tag)
+    auto query = field_matcher<op::ge, fs("level"), 10u>{} &
+                 field_matcher<op::lt, fs("health"), 50.0f>{} &
+                 field_matcher<op::eq, fs("mask"), 8ULL>{};
+
+    auto result = engine::execute(entities, query);
+
+    EXPECT_TRUE(simd::test(result.data(), 42));
+    EXPECT_FALSE(simd::test(result.data(), 43));
+}
+
+TEST(QuestSystem, QuestChainLogic) {
+    const size_t world_size = 100;
+    table players(world_size);
+    players.add_column_u32("level");
+    players.get_col("level").u32[10] = 15; // Player 10 is high level
+
+    datalog::program p;
+    p.add_edb("player_data", players, {"id", "level"});
+    
+    p.add_idb("quest_tutorial_done", world_size);
+    p.add_idb("quest_boss_unlocked", world_size);
+
+    p.add_rule({
+        "quest_boss_unlocked", {"X"}, 
+        {{"player_data", {"X"}}, {"quest_tutorial_done", {"X"}}},
+        [](const table& t) { 
+            return engine::execute(t, field_matcher<op::ge, fs("level"), 10u>{}); 
+        }, 
+        0
+    });
+
+    // 1. Initial state: Player 10 is level 15 but hasn't done tutorial
+    p.evaluate();
+    EXPECT_FALSE(datalog::bits::test(p.get_bits("quest_boss_unlocked"), 10));
+
+    // 2. Player 10 finishes tutorial
+    datalog::bits::set(p.get_bits("quest_tutorial_done"), 10);
+    p.evaluate();
+    
+    // 3. Now boss quest should be unlocked
+    EXPECT_TRUE(datalog::bits::test(p.get_bits("quest_boss_unlocked"), 10));
+}
+
+TEST(SpatialEngine, BoundingBoxQuery) {
+    const size_t n = 100;
+    table world(n);
+    world.add_column_f32("x");
+    world.add_column_f32("y");
+
+    world.get_col("x").f32[7] = 15.0f;
+    world.get_col("y").f32[7] = 35.0f;
+
+    world.get_col("x").f32[8] = 25.0f;
+    world.get_col("y").f32[8] = 35.0f;
+
+    using namespace match;
+    auto box_query = field_matcher<op::ge, fs("x"), 10.0f>{} &
+                     field_matcher<op::lt, fs("x"), 20.0f>{} &
+                     field_matcher<op::ge, fs("y"), 30.0f>{} &
+                     field_matcher<op::lt, fs("y"), 40.0f>{};
+
+    auto result = engine::execute(world, box_query);
+
+    EXPECT_TRUE(simd::test(result.data(), 7));
+    EXPECT_FALSE(simd::test(result.data(), 8));
 }
 
 
