@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 .vscode/
 combined.md
+matcher
