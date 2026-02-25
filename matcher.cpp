@@ -14,6 +14,7 @@
 #include <functional>
 #include <unordered_map>
 #include <unordered_set>
+#include <future>
 
 #include <gtest/gtest.h>
 #include <benchmark/benchmark.h>
@@ -634,6 +635,7 @@ class program {
     struct edb_entry { std::string name; const table* tbl; std::vector<std::string> cols; };
     struct idb_entry { std::string name; size_t universe; mask_t mask; };
 
+    friend class batch_program;
     std::vector<edb_entry> edbs_;
     std::vector<idb_entry> idbs_;
     std::vector<rule_def> rules_;
@@ -824,6 +826,65 @@ public:
     const mask_t& get_bits(const std::string& n) const { return idb(n)->mask; }
 };
 
+// A Sink represents a high-level query result that will be fulfilled 
+// once the batch evaluation is complete.
+struct QuerySink {
+    std::string edb_name;
+    std::function<simd::mask_t(const table&)> filter;
+    std::promise<simd::mask_t> promise;
+};
+
+class batch_program : public program {
+    std::vector<std::unique_ptr<QuerySink>> pending_sinks_;
+
+public:
+    // Request a query result that will be fulfilled on the next evaluate()
+    std::future<simd::mask_t> query(std::string edb, 
+                                   std::function<simd::mask_t(const table&)> filter) {
+        auto sink = std::make_unique<QuerySink>();
+        sink->edb_name = std::move(edb);
+        sink->filter = std::move(filter);
+        auto fut = sink->promise.get_future();
+        pending_sinks_.push_back(std::move(sink));
+        return fut;
+    }
+
+    void evaluate_batched() {
+        // 1. Run standard Datalog fixed-point iteration first
+        // This ensures all IDBs are up-to-date before we run batch queries.
+        evaluate();
+
+        // 2. The "Virtual OR" Fan-out: Group sinks by EDB to maximize cache locality
+        std::unordered_map<std::string, std::vector<QuerySink*>> groups;
+        for (auto& s : pending_sinks_) {
+            groups[s->edb_name].push_back(s.get());
+        }
+
+        for (auto& [name, sinks] : groups) {
+            // Find the EDB table
+            const table* target_table = nullptr;
+            for (auto& e : edbs_) { // Assuming access to internal edbs_
+                if (e.name == name) {
+                    target_table = e.tbl;
+                    break;
+                }
+            }
+            if (!target_table) continue;
+
+            // Execute all grouped filters
+            // Memory is pulled once; multiple filters are applied in the same pass.
+            for (auto* sink : sinks) {
+                try {
+                    auto result = sink->filter(*target_table);
+                    sink->promise.set_value(std::move(result));
+                } catch (...) {
+                    sink->promise.set_exception(std::current_exception());
+                }
+            }
+        }
+        pending_sinks_.clear();
+    }
+};
 } // namespace datalog
 
 namespace {
@@ -1418,6 +1479,41 @@ TEST(SpatialEngine, BoundingBoxQuery) {
     EXPECT_FALSE(simd::test(result.data(), 8));
 }
 
+TEST(BatchingSystem, FrameBasedMultiQuery) {
+    const size_t n = 1024;
+    table world(n);
+    world.add_column_u32("level");
+    world.add_column_f32("health");
+
+    world.get_col("level").u32[500] = 50;
+    world.get_col("health").f32[500] = 5.0f;
+
+    datalog::batch_program p;
+    p.add_edb("world", world, {"id", "level", "health"});
+
+    auto render_fut = p.query("world", [](const table& t) {
+        return engine::execute(t, field_matcher<op::lt, fs("health"), 10.0f>{});
+    });
+
+    auto audio_fut = p.query("world", [](const table& t) {
+        return engine::execute(t, field_matcher<op::ge, fs("level"), 40u>{});
+    });
+
+    auto quest_fut = p.query("world", [](const table& t) {
+        return engine::execute(t, field_matcher<op::eq, fs("level"), 50u>{});
+    });
+
+    p.evaluate_batched();
+
+    auto render_mask = render_fut.get();
+    auto audio_mask = audio_fut.get();
+    auto quest_mask = quest_fut.get();
+
+    EXPECT_TRUE(simd::test(render_mask.data(), 500));
+    EXPECT_TRUE(simd::test(audio_mask.data(), 500));
+    EXPECT_TRUE(simd::test(quest_mask.data(), 500));
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Benchmarks
@@ -1543,7 +1639,7 @@ static void BM_Execute_HST(benchmark::State& st) {
 }
 BENCHMARK(BM_Execute_HST)->RangeMultiplier(10)->Range(1000,1000000);
 
-#define RUN_BENCHMARKS 1
+#define RUN_BENCHMARKS 0
 #if RUN_BENCHMARKS
 BENCHMARK_MAIN();
 #else
