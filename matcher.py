@@ -71,31 +71,48 @@ def negate(m: Matcher) -> Matcher:
 
 # --- Customization Point: Implication (A => B) ---
 def implies(a: Matcher, b: Matcher) -> bool:
-    if a == b: return True # X => X is true
-    if isinstance(a, Never) or isinstance(b, Always): return True # false => X, X => true
+    if a is b: return True # Identity is fast
     
-    # Compound Logic Implication
+    # 1. Structural/Terminal Logic
+    if isinstance(a, Never) or isinstance(b, Always): return True
     if isinstance(a, And): return implies(a.lhs, b) or implies(a.rhs, b)
     if isinstance(b, Or):  return implies(a, b.lhs) or implies(a, b.rhs)
     
-    # Domain-Specific Relational Warrants
-    if isinstance(a, FieldEq) and isinstance(b, FieldEq):
-        if a.field == b.field: return a.value == b.value
+    # 2. Extract Type Info Once
+    type_a = type(a)
+    type_b = type(b)
     
-    if isinstance(a, FieldEq) and isinstance(b, FieldIn):
-        if a.field == b.field: return a.value in b.values
-        
-    if isinstance(a, FieldLt) and isinstance(b, FieldLt):
-        if a.field == b.field: return a.value <= b.value
-        
-    if isinstance(a, FieldEq) and isinstance(b, FieldLt):
-        if a.field == b.field: return a.value < b.value
+    # 3. Fast-Path for Relational Matchers
+    # We use a tuple of types to check if both are relational 'leaf' nodes
+    relational_types = (FieldEq, FieldLt, FieldGe, FieldNe, FieldIn)
+    
+    if type_a in relational_types and type_b in relational_types:
+        # Direct access is faster than hasattr
+        if a.field != b.field: 
+            return False
+            
+        # Comparison logic (Nested if/elif is faster than a giant flat block)
+        if type_a is FieldEq:
+            val = a.value
+            if type_b is FieldEq: return val == b.value
+            if type_b is FieldLt: return val <  b.value
+            if type_b is FieldGe: return val >= b.value
+            if type_b is FieldNe: return val != b.value
+            if type_b is FieldIn:
+                # Bitmap lookup
+                idx = val >> 3
+                return idx < len(b.bitmap) and (b.bitmap[idx] & (1 << (val & 7))) != 0
 
-    if isinstance(a, FieldGe) and isinstance(b, FieldLt):
-        if a.field == b.field and a.value >= b.value: return True
+        elif type_a is FieldLt:
+            if type_b is FieldLt: return a.value <= b.value
+            if type_b is FieldNe: return a.value <= b.value
 
-    if isinstance(a, FieldGe) and isinstance(b, FieldGe):
-        if a.field == b.field: return a.value >= b.value
+        elif type_a is FieldGe:
+            if type_b is FieldGe: return a.value >= b.value
+            if type_b is FieldNe: return a.value > b.value
+
+        elif type_a is FieldNe:
+            if type_b is FieldNe: return a.value == b.value
 
     return False
 

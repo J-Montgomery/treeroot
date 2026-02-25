@@ -129,3 +129,20 @@ class SIMDEngine:
             delta_mask = reachable_from_delta & ~total_mask
             total_mask |= delta_mask
         return FieldIn(id_field, np.packbits(total_mask, bitorder='little'))
+
+    @staticmethod
+    def aggregate(table: ECSTable, query: Matcher, column: str, op: str = "sum"):
+        # 1. Get the mask for the entities we care about
+        mask = SIMDEngine.execute(table, query)
+        
+        # 2. Extract the active data (Zero-copy view where possible)
+        data = table.cols[column][mask]
+        
+        # 3. Perform the reduction
+        if op == "sum":   return np.sum(data)
+        if op == "max":   return np.max(data)
+        if op == "min":   return np.min(data)
+        if op == "mean":  return np.mean(data)
+        if op == "count": return len(data)
+        
+        raise ValueError(f"Unsupported operator: {op}")

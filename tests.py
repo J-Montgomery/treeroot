@@ -319,6 +319,81 @@ def test_recursive_chain():
     
     assert num_found == CHAIN_LENGTH
 
+def test_cyclic_recursion():
+    print("\n--- Testing Cyclic Recursion (Infinite Loop Guard) ---")
+    table = ECSTable(100)
+    table.add_column("parent_id", np.uint32, default_val=999)
+    
+    # Create a cycle: 0 -> 1, 1 -> 0
+    table.cols["parent_id"][0] = 1
+    table.cols["parent_id"][1] = 0
+    
+    initial_seed = FieldEq("id", 0)
+    
+    # This returns a Matcher (FieldIn)
+    result_matcher = SIMDEngine.semi_naive_join(table, initial_seed, "parent_id")
+    
+    # YOU MUST EXECUTE IT TO GET THE MASK
+    final_mask = SIMDEngine.execute(table, result_matcher)
+    
+    num_found = np.sum(final_mask)
+    print(f"Cycle test found {num_found} entities.")
+    assert num_found == 2
+
+def test_contradiction_execution():
+    print("\n--- Testing Contradiction Pruning ---")
+    table = ECSTable(1000)
+    table.add_column("val", np.int32, default_val=10)
+    
+    # Query: (val == 10) AND (val != 10)
+    impossible_query = FieldEq("val", 10) & negate(FieldEq("val", 10))
+    
+    # The execute() method should simplify this to Never() immediately
+    start = time.time()
+    mask = SIMDEngine.execute(table, impossible_query)
+    exec_time = time.time() - start
+    
+    print(f"Contradiction check time: {exec_time:.8f}s")
+    assert np.sum(mask) == 0
+
+def test_empty_join():
+    print("\n--- Testing Join against Empty Set ---")
+    players = ECSTable(100)
+    # Register the column so the "schema" is valid
+    players.add_column("team", np.int32, default_val=0) 
+    
+    pets = ECSTable(100)
+    pets.add_column("owner_id", np.uint32, default_val=0)
+    
+    # 1. Query for a player on a team that has 0 members
+    # This is a valid query but produces an all-False mask
+    phantom_player = FieldEq("team", 999) 
+    
+    # 2. Semi-join: This will pack an all-zero bitmap
+    join_matcher = SIMDEngine.semi_join(players, phantom_player, "owner_id")
+    
+    # 3. Final execution: Should return 0 matches
+    mask = SIMDEngine.execute(pets, join_matcher)
+    
+    num_found = np.sum(mask)
+    print(f"Empty join found {num_found} pets.")
+    assert num_found == 0
+
+def test_tautology_skip():
+    print("\n--- Testing Tautology (Always True) ---")
+    table = ECSTable(1_000_000)
+    table.add_column("health", np.float32, default_val=50.0)
+    
+    # (Health < 100) OR (Health >= 100) -> Always()
+    always_query = FieldLt("health", 100.0) | FieldGe("health", 100.0)
+    
+    optimized = simplify(always_query)
+    print(f"Optimized query: {optimized}")
+    assert isinstance(optimized, Always)
+    
+    mask = SIMDEngine.execute(table, always_query)
+    assert np.all(mask)
+
 if __name__ == "__main__":
     test_algebraic_simplifications()
     test_ecs_with_joins()
@@ -327,4 +402,9 @@ if __name__ == "__main__":
     test_triple_join()
     test_negative_join()
     test_hierarchical_tags_with_bloom()
+
     test_recursive_chain()
+    test_cyclic_recursion()
+    test_contradiction_execution()
+    test_empty_join()
+    test_tautology_skip()
