@@ -57,10 +57,26 @@ inline bool any(const uint64_t* a, size_t n) {
     for (size_t i = 0; i < n; ++i) if (a[i]) return true; return false;
 }
 
-template<typename T, typename V> void cmp_eq(uint64_t* m, const T* d, V v, size_t n) { for (size_t i=0;i<n;++i) if (d[i]==(T)v) set(m,i); }
-template<typename T, typename V> void cmp_ne(uint64_t* m, const T* d, V v, size_t n) { for (size_t i=0;i<n;++i) if (d[i]!=(T)v) set(m,i); }
-template<typename T, typename V> void cmp_lt(uint64_t* m, const T* d, V v, size_t n) { for (size_t i=0;i<n;++i) if (d[i]< (T)v) set(m,i); }
-template<typename T, typename V> void cmp_ge(uint64_t* m, const T* d, V v, size_t n) { for (size_t i=0;i<n;++i) if (d[i]>=(T)v) set(m,i); }
+// Word-building: accumulates into a register, assigns whole words.
+// Handles partial last word (bits start at 0), so no pre-zeroing or
+// clear_tail needed by callers.
+template<typename T, typename V, typename Pred>
+void cmp_fill(uint64_t* m, const T* d, V v, size_t n, Pred pred) {
+    size_t nw = num_words(n);
+    for (size_t w = 0; w < nw; ++w) {
+        uint64_t bits = 0;
+        size_t base = w * 64;
+        size_t cnt = std::min<size_t>(64, n - base);
+        for (size_t b = 0; b < cnt; ++b)
+            if (pred(d[base + b], static_cast<T>(v))) bits |= 1ULL << b;
+        m[w] = bits;
+    }
+}
+
+template<typename T, typename V> void cmp_eq(uint64_t* m, const T* d, V v, size_t n) { cmp_fill(m,d,v,n,[](auto a, auto b){return a==b;}); }
+template<typename T, typename V> void cmp_ne(uint64_t* m, const T* d, V v, size_t n) { cmp_fill(m,d,v,n,[](auto a, auto b){return a!=b;}); }
+template<typename T, typename V> void cmp_lt(uint64_t* m, const T* d, V v, size_t n) { cmp_fill(m,d,v,n,[](auto a, auto b){return a< b;}); }
+template<typename T, typename V> void cmp_ge(uint64_t* m, const T* d, V v, size_t n) { cmp_fill(m,d,v,n,[](auto a, auto b){return a>=b;}); }
 
 } // namespace simd
 
@@ -104,7 +120,6 @@ template<typename T> inline constexpr bool is_not_v = is_not_i<std::remove_cvref
 template<typename T> inline constexpr bool is_and_v = is_and_i<std::remove_cvref_t<T>>::value;
 template<typename T> inline constexpr bool is_or_v  = is_or_i <std::remove_cvref_t<T>>::value;
 
-// Runtime bitmap matcher
 struct field_in {
     using is_matcher = void;
     std::string_view field;
@@ -117,9 +132,6 @@ template<typename M>             inline constexpr bool is_static_v<not_t<M>>    
 template<typename L, typename R> inline constexpr bool is_static_v<and_t<L,R>> = is_static_v<L> && is_static_v<R>;
 template<typename L, typename R> inline constexpr bool is_static_v<or_t<L,R>>  = is_static_v<L> && is_static_v<R>;
 
-// ── CPO: implies ──
-// Structural rules: never, always, And, Or-on-RHS, Or-on-LHS, contrapositive.
-// Leaf rules dispatched via tag_invoke.
 constexpr inline class implies_t {
 public:
     template<typename L, typename R>
@@ -139,8 +151,6 @@ public:
     }
 } implies{};
 
-// ── CPO: negate ──
-// Matches Python: wraps And/Or in not_t (no De Morgan distribution).
 constexpr inline class negate_t {
 public:
     template<typename M>
@@ -157,8 +167,6 @@ public:
 template<matcher L, matcher R> constexpr auto operator&(L l, R r);
 template<matcher L, matcher R> constexpr auto operator|(L l, R r);
 
-// ── CPO: simplify ──
-// Recurses into and_t/or_t then re-applies operators for subsumption.
 constexpr inline class simplify_t {
 public:
     template<typename M>
@@ -174,10 +182,6 @@ public:
     }
 } simplify{};
 
-// ── CPO: sum_of_products (DNF) ──
-// De Morgan is applied here (not in negate) so that DNF conversion
-// pushes negation to leaves. This goes beyond Python parity but is
-// strictly correct and enables extract_bits on distributed results.
 constexpr inline class sum_of_products_t {
 public:
     template<typename M>
@@ -209,8 +213,6 @@ public:
         else return s;
     }
 } sum_of_products{};
-
-// ── Expression operators ──
 
 template<matcher L, matcher R>
 constexpr auto operator&(L l, R r) {
@@ -314,7 +316,7 @@ struct field_hst {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Columnar Table with Bloom-Filter Chunk Summaries
+// Columnar Table
 // ═══════════════════════════════════════════════════════════════════════════════
 
 struct table {
@@ -342,7 +344,6 @@ struct table {
     }
 
     size_t num_chunks() const { return rows ? (rows + chunk_size - 1) / chunk_size : 0; }
-
     column&       get_col(std::string_view n)       { for (auto& c:cols) if (c.name==n) return c; throw std::runtime_error("no col"); }
     const column& get_col(std::string_view n) const { for (auto& c:cols) if (c.name==n) return c; throw std::runtime_error("no col"); }
 
@@ -361,26 +362,41 @@ struct table {
 // Execution Engine
 // ═══════════════════════════════════════════════════════════════════════════════
 
+namespace detail {
+// True when a matcher's eval_into needs the scratch buffer internally
+// (i.e. it is a binary op, or a not_t wrapping one).
+template<typename T> inline constexpr bool needs_scratch = false;
+template<typename L, typename R> inline constexpr bool needs_scratch<match::and_t<L,R>> = true;
+template<typename L, typename R> inline constexpr bool needs_scratch<match::or_t<L,R>> = true;
+template<typename M> inline constexpr bool needs_scratch<match::not_t<M>> = needs_scratch<M>;
+}
+
 struct engine {
     using mask_t = simd::mask_t;
 
     static mask_t execute(const table& t, match::matcher auto const& m) {
         auto sop = match::sum_of_products(m);
         uint64_t req = extract_bits(sop);
-        mask_t result(simd::num_words(t.rows), 0);
+        size_t nw = simd::num_words(t.rows);
+        mask_t result(nw, 0);
 
         if (req == 0 || t.chunk_summaries.empty()) {
-            result = eval(t, sop, 0, t.rows);
+            mask_t scratch(nw);
+            eval_into(t, sop, 0, t.rows, result.data(), scratch.data(), nw);
         } else {
+            size_t max_cnw = simd::num_words(t.chunk_size);
+            mask_t chunk_buf(max_cnw);
+            mask_t scratch(max_cnw);
             for (size_t c = 0; c < t.num_chunks(); ++c) {
                 if ((t.chunk_summaries[c] & req) != req) continue;
                 size_t start = c * t.chunk_size;
                 size_t count = std::min(t.chunk_size, t.rows - start);
-                auto chunk = eval(t, sop, start, count);
-                simd::bor(result.data() + start / 64, chunk.data(), chunk.size());
+                size_t cnw = simd::num_words(count);
+                eval_into(t, sop, start, count, chunk_buf.data(), scratch.data(), cnw);
+                simd::bor(result.data() + start / 64, chunk_buf.data(), cnw);
             }
         }
-        simd::clear_tail(result.data(), result.size(), t.rows);
+        simd::clear_tail(result.data(), nw, t.rows);
         return result;
     }
 
@@ -419,7 +435,7 @@ struct engine {
     }
 
 private:
-    // ── Extract required mask bits for bloom-filter chunk skipping ──
+    // ── extract_bits ──
 
     template<typename M>
     static uint64_t extract_bits(M const&) { return 0; }
@@ -430,22 +446,18 @@ private:
             return static_cast<uint64_t>(Val);
         else return 0;
     }
-
     template<match::matcher L, match::matcher R>
     static uint64_t extract_bits(match::and_t<L,R> const& a) {
         return extract_bits(a.lhs) | extract_bits(a.rhs);
     }
-
-    // For DNF (top-level or_t): intersect children's required bits.
-    // A chunk can only be skipped if BOTH branches are impossible.
     template<match::matcher L, match::matcher R>
     static uint64_t extract_bits(match::or_t<L,R> const& o) {
-        auto l = extract_bits(o.lhs);
-        auto r = extract_bits(o.rhs);
+        auto l = extract_bits(o.lhs), r = extract_bits(o.rhs);
         return (l && r) ? (l & r) : 0;
     }
 
-    // ── Aggregate reduction ──
+    // ── agg_impl ──
+
     template<typename T>
     static double agg_impl(const mask_t& mask, const std::vector<T>& data,
                            agg op, size_t rows) {
@@ -463,78 +475,92 @@ private:
         return (op == agg::mean && n) ? r / n : r;
     }
 
-    // ── Eval: returns local mask for rows [start .. start+count) ──
+    // ── eval_into: writes result into out[0..nw) ──
+    // scratch[0..nw) is temp space for binary ops.  Leaves ignore it.
+    // For left-deep trees (the shape operator& builds) zero extra
+    // allocations occur; a fallback alloc fires only when the RIGHT
+    // child of a binary node is itself compound.
 
-    static mask_t eval(const table&, match::always_t, size_t, size_t count) {
-        mask_t m(simd::num_words(count), ~0ULL);
-        simd::clear_tail(m.data(), m.size(), count);
-        return m;
+    static void eval_into(const table&, match::always_t, size_t, size_t count,
+                          uint64_t* out, uint64_t*, size_t nw) {
+        std::fill_n(out, nw, ~0ULL);
+        simd::clear_tail(out, nw, count);
     }
-    static mask_t eval(const table&, match::never_t, size_t, size_t count) {
-        return mask_t(simd::num_words(count), 0);
+    static void eval_into(const table&, match::never_t, size_t, size_t,
+                          uint64_t* out, uint64_t*, size_t nw) {
+        std::fill_n(out, nw, 0);
     }
 
     template<match::matcher L, match::matcher R>
-    static mask_t eval(const table& t, match::and_t<L,R> const& a, size_t s, size_t c) {
-        auto l = eval(t, a.lhs, s, c);
-        auto r = eval(t, a.rhs, s, c);
-        simd::band(l.data(), r.data(), l.size());
-        return l;
+    static void eval_into(const table& t, match::and_t<L,R> const& a,
+                          size_t s, size_t c, uint64_t* out, uint64_t* scratch, size_t nw) {
+        eval_into(t, a.lhs, s, c, out, scratch, nw);
+        if constexpr (detail::needs_scratch<R>) {
+            mask_t tmp(nw);
+            eval_into(t, a.rhs, s, c, scratch, tmp.data(), nw);
+        } else {
+            eval_into(t, a.rhs, s, c, scratch, nullptr, nw);
+        }
+        simd::band(out, scratch, nw);
     }
+
     template<match::matcher L, match::matcher R>
-    static mask_t eval(const table& t, match::or_t<L,R> const& o, size_t s, size_t c) {
-        auto l = eval(t, o.lhs, s, c);
-        auto r = eval(t, o.rhs, s, c);
-        simd::bor(l.data(), r.data(), l.size());
-        return l;
+    static void eval_into(const table& t, match::or_t<L,R> const& o,
+                          size_t s, size_t c, uint64_t* out, uint64_t* scratch, size_t nw) {
+        eval_into(t, o.lhs, s, c, out, scratch, nw);
+        if constexpr (detail::needs_scratch<R>) {
+            mask_t tmp(nw);
+            eval_into(t, o.rhs, s, c, scratch, tmp.data(), nw);
+        } else {
+            eval_into(t, o.rhs, s, c, scratch, nullptr, nw);
+        }
+        simd::bor(out, scratch, nw);
     }
+
     template<match::matcher M>
-    static mask_t eval(const table& t, match::not_t<M> const& n, size_t s, size_t c) {
-        auto m = eval(t, n.m, s, c);
-        simd::bnot(m.data(), m.size());
-        simd::clear_tail(m.data(), m.size(), c);
-        return m;
+    static void eval_into(const table& t, match::not_t<M> const& n,
+                          size_t s, size_t c, uint64_t* out, uint64_t* scratch, size_t nw) {
+        eval_into(t, n.m, s, c, out, scratch, nw);
+        simd::bnot(out, nw);
+        simd::clear_tail(out, nw, c);
     }
 
     template<op O, fs Field, auto Val>
-    static mask_t eval(const table& t, field_matcher<O,Field,Val> const&,
-                       size_t start, size_t count) {
+    static void eval_into(const table& t, field_matcher<O,Field,Val> const&,
+                          size_t start, size_t count, uint64_t* out, uint64_t*, size_t nw) {
         auto& col = t.get_col(Field.view());
-        mask_t m(simd::num_words(count), 0);
-        auto cmp = [&]<typename T>(const std::vector<T>& d) {
+        auto do_cmp = [&]<typename T>(const std::vector<T>& d) {
             const T* p = d.data() + start;
-            if constexpr (O==op::eq) simd::cmp_eq(m.data(), p, (T)Val, count);
-            if constexpr (O==op::ne) simd::cmp_ne(m.data(), p, (T)Val, count);
-            if constexpr (O==op::lt) simd::cmp_lt(m.data(), p, (T)Val, count);
-            if constexpr (O==op::ge) simd::cmp_ge(m.data(), p, (T)Val, count);
+            if constexpr (O==op::eq) simd::cmp_eq(out, p, (T)Val, count);
+            if constexpr (O==op::ne) simd::cmp_ne(out, p, (T)Val, count);
+            if constexpr (O==op::lt) simd::cmp_lt(out, p, (T)Val, count);
+            if constexpr (O==op::ge) simd::cmp_ge(out, p, (T)Val, count);
         };
-        if      (!col.u32.empty()) cmp(col.u32);
-        else if (!col.f32.empty()) cmp(col.f32);
-        else if (!col.u64.empty()) cmp(col.u64);
-        return m;
+        if      (!col.u32.empty()) do_cmp(col.u32);
+        else if (!col.f32.empty()) do_cmp(col.f32);
+        else if (!col.u64.empty()) do_cmp(col.u64);
+        else std::fill_n(out, nw, 0);
     }
 
     template<fs Field, fs Path>
-    static mask_t eval(const table& t, field_hst<Field,Path> const&,
-                       size_t start, size_t count) {
+    static void eval_into(const table& t, field_hst<Field,Path> const&,
+                          size_t start, size_t count, uint64_t* out, uint64_t*, size_t nw) {
+        std::fill_n(out, nw, 0);
         auto& d = t.get_col(Field.view()).str;
-        mask_t m(simd::num_words(count), 0);
         for (size_t i = 0; i < count; ++i)
-            if (d[start+i].starts_with(Path.view())) simd::set(m.data(), i);
-        return m;
+            if (d[start+i].starts_with(Path.view())) simd::set(out, i);
     }
 
-    static mask_t eval(const table& t, match::field_in const& f,
-                       size_t start, size_t count) {
+    static void eval_into(const table& t, match::field_in const& f,
+                          size_t start, size_t count, uint64_t* out, uint64_t*, size_t nw) {
+        std::fill_n(out, nw, 0);
         auto& d = t.get_col(f.field).u32;
         auto& bm = *f.bitmap;
-        mask_t m(simd::num_words(count), 0);
         for (size_t i = 0; i < count; ++i) {
             uint32_t v = d[start + i];
             if (v / 64 < bm.size() && simd::test(bm.data(), v))
-                simd::set(m.data(), i);
+                simd::set(out, i);
         }
-        return m;
     }
 };
 
@@ -823,7 +849,7 @@ static void BM_SemiNaive(benchmark::State& st) {
 }
 BENCHMARK(BM_SemiNaive);
 
-#define RUN_BENCHMARKS 1
+#define RUN_BENCHMARKS 0
 #if RUN_BENCHMARKS
 BENCHMARK_MAIN();
 #else
