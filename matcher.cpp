@@ -14,7 +14,6 @@
 #include <functional>
 #include <unordered_map>
 #include <unordered_set>
-#include <numeric>
 
 #include <gtest/gtest.h>
 #include <benchmark/benchmark.h>
@@ -63,9 +62,6 @@ inline bool any(const uint64_t* a, size_t n) {
     for (size_t i = 0; i < n; ++i) if (a[i]) return true; return false;
 }
 
-// Word-building: accumulates into a register, assigns whole words.
-// Handles partial last word (bits start at 0), so no pre-zeroing or
-// clear_tail needed by callers.
 template<typename T, typename V, typename Pred>
 void cmp_fill(uint64_t* m, const T* d, V v, size_t n, Pred pred) {
     size_t nw = num_words(n);
@@ -85,6 +81,50 @@ template<typename T, typename V> void cmp_lt(uint64_t* m, const T* d, V v, size_
 template<typename T, typename V> void cmp_ge(uint64_t* m, const T* d, V v, size_t n) { cmp_fill(m,d,v,n,[](auto a, auto b){return a>=b;}); }
 
 } // namespace simd
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Lexicographical Hierarchy Manager
+// ═══════════════════════════════════════════════════════════════════════════════
+
+class hierarchy_dict {
+    std::vector<std::string> strings_;
+    bool frozen_ = false;
+public:
+    hierarchy_dict() = default;
+    template<typename It>
+    hierarchy_dict(It begin, It end) : strings_(begin, end) { freeze(); }
+
+    void insert(std::string s) {
+        if (!frozen_) strings_.push_back(std::move(s));
+    }
+
+    void freeze() {
+        if (frozen_) return;
+        std::sort(strings_.begin(), strings_.end());
+        strings_.erase(std::unique(strings_.begin(), strings_.end()), strings_.end());
+        frozen_ = true;
+    }
+
+    uint32_t get_id(std::string_view s) const {
+        auto it = std::lower_bound(strings_.begin(), strings_.end(), s);
+        if (it != strings_.end() && *it == s) return std::distance(strings_.begin(), it);
+        return 0; 
+    }
+
+    // Returns [inclusive_min, exclusive_max)
+    std::pair<uint32_t, uint32_t> get_prefix_range(std::string_view prefix) const {
+        auto it_start = std::lower_bound(strings_.begin(), strings_.end(), prefix);
+        std::string upper = std::string(prefix);
+        if (!upper.empty()) {
+            upper.back()++; 
+        }
+        auto it_end = std::lower_bound(strings_.begin(), strings_.end(), upper);
+        return {
+            std::distance(strings_.begin(), it_start),
+            std::distance(strings_.begin(), it_end)
+        };
+    }
+};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Algebraic Engine (constexpr)
@@ -331,31 +371,39 @@ struct table {
 
     struct column {
         std::string_view name;
-        std::vector<uint32_t>    u32;
-        std::vector<float>       f32;
-        std::vector<uint64_t>    u64;
-        std::vector<std::string> str;
+        std::vector<uint32_t> u32;
+        std::vector<float>    f32;
+        std::vector<uint64_t> u64;
     };
 
     std::vector<column>   cols;
+    std::unordered_map<std::string, hierarchy_dict> dicts;
     std::vector<uint64_t> chunk_summaries;
 
     explicit table(size_t n = 0, size_t cs = 1024) : rows(n), chunk_size(cs) {
         assert(cs % 64 == 0);
         std::vector<uint32_t> ids(n);
         std::iota(ids.begin(), ids.end(), 0u);
-        cols.push_back({"id", std::move(ids), {}, {}, {}});
-        cols.push_back({"mask", {}, {}, std::vector<uint64_t>(n, 0), {}});
+        cols.push_back({"id", std::move(ids), {}, {}});
+        cols.push_back({"mask", {}, {}, std::vector<uint64_t>(n, 0)});
         chunk_summaries.resize(num_chunks(), 0);
     }
 
     size_t num_chunks() const { return rows ? (rows + chunk_size - 1) / chunk_size : 0; }
-    column&       get_col(std::string_view n)       { for (auto& c:cols) if (c.name==n) return c; throw std::runtime_error("no col"); }
-    const column& get_col(std::string_view n) const { for (auto& c:cols) if (c.name==n) return c; throw std::runtime_error("no col"); }
+    column&       get_col(std::string_view n)       { for (auto& c:cols) if (c.name==n) return c; throw std::runtime_error(std::string("no col: ") + std::string(n)); }
+    const column& get_col(std::string_view n) const { for (auto& c:cols) if (c.name==n) return c; throw std::runtime_error(std::string("no col: ") + std::string(n)); }
 
-    void add_column_u32(std::string_view n, uint32_t d=0) { cols.push_back({n, std::vector<uint32_t>(rows,d), {}, {}, {}}); }
-    void add_column_f32(std::string_view n, float d=0.f)  { cols.push_back({n, {}, std::vector<float>(rows,d), {}, {}}); }
-    void add_column_str(std::string_view n)                { cols.push_back({n, {}, {}, {}, std::vector<std::string>(rows)}); }
+    void add_column_u32(std::string_view n, uint32_t d=0) { cols.push_back({n, std::vector<uint32_t>(rows,d), {}, {}}); }
+    void add_column_f32(std::string_view n, float d=0.f)  { cols.push_back({n, {}, std::vector<float>(rows,d), {}}); }
+    
+    // Interns strings immediately.
+    void add_column_hst(std::string_view n, const std::vector<std::string>& vals) {
+        hierarchy_dict dict(vals.begin(), vals.end());
+        std::vector<uint32_t> ids(rows);
+        for (size_t i = 0; i < rows && i < vals.size(); ++i) ids[i] = dict.get_id(vals[i]);
+        cols.push_back({n, std::move(ids), {}, {}});
+        dicts[std::string(n)] = std::move(dict);
+    }
 
     void set_tag(size_t eid, int tag) {
         uint64_t bit = 1ULL << (tag % 64);
@@ -369,8 +417,6 @@ struct table {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 namespace detail {
-// True when a matcher's eval_into needs the scratch buffer internally
-// (i.e. it is a binary op, or a not_t wrapping one).
 template<typename T> inline constexpr bool needs_scratch = false;
 template<typename L, typename R> inline constexpr bool needs_scratch<match::and_t<L,R>> = true;
 template<typename L, typename R> inline constexpr bool needs_scratch<match::or_t<L,R>> = true;
@@ -441,34 +487,26 @@ struct engine {
     }
 
 private:
-    // ── extract_bits ──
-
     template<typename M>
     static uint64_t extract_bits(M const&) { return 0; }
 
     template<op O, fs Field, auto Val>
     static uint64_t extract_bits(field_matcher<O, Field, Val> const&) {
-        if constexpr (O == op::eq && Field == fs("mask"))
-            return static_cast<uint64_t>(Val);
+        if constexpr (O == op::eq && Field == fs("mask")) return static_cast<uint64_t>(Val);
         else return 0;
     }
     template<match::matcher L, match::matcher R>
-    static uint64_t extract_bits(match::and_t<L,R> const& a) {
-        return extract_bits(a.lhs) | extract_bits(a.rhs);
-    }
+    static uint64_t extract_bits(match::and_t<L,R> const& a) { return extract_bits(a.lhs) | extract_bits(a.rhs); }
     template<match::matcher L, match::matcher R>
     static uint64_t extract_bits(match::or_t<L,R> const& o) {
         auto l = extract_bits(o.lhs), r = extract_bits(o.rhs);
         return (l && r) ? (l & r) : 0;
     }
 
-    // ── agg_impl ──
-
     template<typename T>
     static double agg_impl(const mask_t& mask, const std::vector<T>& data,
                            agg op, size_t rows) {
-        if (op == agg::count)
-            return (double)simd::popcount(mask.data(), mask.size());
+        if (op == agg::count) return (double)simd::popcount(mask.data(), mask.size());
         double r = 0; size_t n = 0; bool first = true;
         for (size_t i = 0; i < rows; ++i) {
             if (!simd::test(mask.data(), i)) continue;
@@ -481,29 +519,20 @@ private:
         return (op == agg::mean && n) ? r / n : r;
     }
 
-    // ── eval_into: writes result into out[0..nw) ──
-    // scratch[0..nw) is temp space for binary ops.  Leaves ignore it.
-    // For left-deep trees (the shape operator& builds) zero extra
-    // allocations occur; a fallback alloc fires only when the RIGHT
-    // child of a binary node is itself compound.
-
     static void eval_into(const table&, match::always_t, size_t, size_t count,
                           uint64_t* out, uint64_t*, size_t nw) {
         std::fill_n(out, nw, ~0ULL);
         simd::clear_tail(out, nw, count);
     }
     static void eval_into(const table&, match::never_t, size_t, size_t,
-                          uint64_t* out, uint64_t*, size_t nw) {
-        std::fill_n(out, nw, 0);
-    }
+                          uint64_t* out, uint64_t*, size_t nw) { std::fill_n(out, nw, 0); }
 
     template<match::matcher L, match::matcher R>
     static void eval_into(const table& t, match::and_t<L,R> const& a,
                           size_t s, size_t c, uint64_t* out, uint64_t* scratch, size_t nw) {
         eval_into(t, a.lhs, s, c, out, scratch, nw);
         if constexpr (detail::needs_scratch<R>) {
-            mask_t tmp(nw);
-            eval_into(t, a.rhs, s, c, scratch, tmp.data(), nw);
+            mask_t tmp(nw); eval_into(t, a.rhs, s, c, scratch, tmp.data(), nw);
         } else {
             eval_into(t, a.rhs, s, c, scratch, nullptr, nw);
         }
@@ -515,8 +544,7 @@ private:
                           size_t s, size_t c, uint64_t* out, uint64_t* scratch, size_t nw) {
         eval_into(t, o.lhs, s, c, out, scratch, nw);
         if constexpr (detail::needs_scratch<R>) {
-            mask_t tmp(nw);
-            eval_into(t, o.rhs, s, c, scratch, tmp.data(), nw);
+            mask_t tmp(nw); eval_into(t, o.rhs, s, c, scratch, tmp.data(), nw);
         } else {
             eval_into(t, o.rhs, s, c, scratch, nullptr, nw);
         }
@@ -551,10 +579,17 @@ private:
     template<fs Field, fs Path>
     static void eval_into(const table& t, field_hst<Field,Path> const&,
                           size_t start, size_t count, uint64_t* out, uint64_t*, size_t nw) {
-        std::fill_n(out, nw, 0);
-        auto& d = t.get_col(Field.view()).str;
-        for (size_t i = 0; i < count; ++i)
-            if (d[start+i].starts_with(Path.view())) simd::set(out, i);
+        auto it = t.dicts.find(std::string(Field.view()));
+        if (it == t.dicts.end()) { std::fill_n(out, nw, 0); return; }
+        
+        auto [low, high] = it->second.get_prefix_range(Path.view());
+        if (low == high) { std::fill_n(out, nw, 0); return; }
+
+        auto& col = t.get_col(Field.view()).u32;
+        const uint32_t* p = col.data() + start;
+        simd::cmp_fill(out, p, 0, count, [=](uint32_t v, auto) {
+            return v >= low && v < high;
+        });
     }
 
     static void eval_into(const table& t, match::field_in const& f,
@@ -564,30 +599,25 @@ private:
         auto& bm = *f.bitmap;
         for (size_t i = 0; i < count; ++i) {
             uint32_t v = d[start + i];
-            if (v / 64 < bm.size() && simd::test(bm.data(), v))
-                simd::set(out, i);
+            if (v / 64 < bm.size() && simd::test(bm.data(), v)) simd::set(out, i);
         }
     }
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Monadic Datalog Engine
+// ═══════════════════════════════════════════════════════════════════════════════
+
 namespace datalog {
 
 using mask_t = engine::mask_t;
 
 namespace bits {
     inline size_t words(size_t n) { return (n + 63) / 64; }
-    inline bool test(const mask_t& m, size_t i) {
-        return i / 64 < m.size() && (m[i / 64] & (1ULL << (i % 64)));
-    }
-    inline void set(mask_t& m, size_t i) {
-        if (i / 64 < m.size()) m[i / 64] |= (1ULL << (i % 64));
-    }
-    inline void clear_tail(mask_t& m, size_t n) {
-        if (n % 64 && !m.empty()) m.back() &= (1ULL << (n % 64)) - 1;
-    }
-    inline bool any(const mask_t& m) {
-        for (auto w : m) if (w) return true;
-        return false;
-    }
+    inline bool test(const mask_t& m, size_t i) { return i / 64 < m.size() && (m[i / 64] & (1ULL << (i % 64))); }
+    inline void set(mask_t& m, size_t i) { if (i / 64 < m.size()) m[i / 64] |= (1ULL << (i % 64)); }
+    inline void clear_tail(mask_t& m, size_t n) { if (n % 64 && !m.empty()) m.back() &= (1ULL << (n % 64)) - 1; }
+    inline bool any(const mask_t& m) { for (auto w : m) if (w) return true; return false; }
 }
 
 struct atom { std::string rel; std::vector<std::string> vars; bool negated = false; };
@@ -601,61 +631,23 @@ struct rule_def {
 };
 
 class program {
-    // ── storage ──────────────────────────────────────────────────────────────
     struct edb_entry { std::string name; const table* tbl; std::vector<std::string> cols; };
-
-    struct tuple_hash {
-        size_t operator()(const std::vector<uint32_t>& v) const {
-            size_t h = v.size();
-            for (auto x : v) h ^= std::hash<uint32_t>{}(x) + 0x9e3779b9 + (h<<6) + (h>>2);
-            return h;
-        }
-    };
-
-    struct idb_entry {
-        std::string name;
-        bool unary;
-        size_t universe;
-        mask_t mask;
-        std::vector<std::string> col_names;
-        std::vector<std::vector<uint32_t>> data;
-        size_t nrows;
-        std::unordered_set<std::vector<uint32_t>, tuple_hash> seen;
-
-        bool insert(const std::vector<uint32_t>& t) {
-            if (!seen.insert(t).second) return false;
-            for (size_t c = 0; c < t.size(); ++c) data[c].push_back(t[c]);
-            ++nrows;
-            return true;
-        }
-    };
+    struct idb_entry { std::string name; size_t universe; mask_t mask; };
 
     std::vector<edb_entry> edbs_;
     std::vector<idb_entry> idbs_;
     std::vector<rule_def> rules_;
 
     const edb_entry* edb(const std::string& n) const {
-        for (auto& e : edbs_) if (e.name == n) return &e;
-        return nullptr;
+        for (auto& e : edbs_) if (e.name == n) return &e; return nullptr;
     }
     idb_entry* idb(const std::string& n) {
-        for (auto& e : idbs_) if (e.name == n) return &e;
-        return nullptr;
+        for (auto& e : idbs_) if (e.name == n) return &e; return nullptr;
     }
     const idb_entry* idb(const std::string& n) const {
-        for (auto& e : idbs_) if (e.name == n) return &e;
-        return nullptr;
+        for (auto& e : idbs_) if (e.name == n) return &e; return nullptr;
     }
 
-    // ── variable environment ─────────────────────────────────────────────────
-    using env_t = std::vector<std::pair<std::string, uint32_t>>;
-
-    static const uint32_t* lookup(const env_t& e, const std::string& v) {
-        for (auto& [k, val] : e) if (k == v) return &val;
-        return nullptr;
-    }
-
-    // find column in ea that shares a variable name with ba
     static int shared_edb_col(const atom& ea, const atom& ba) {
         for (size_t i = 0; i < ba.vars.size(); ++i)
             for (size_t j = 0; j < ea.vars.size(); ++j)
@@ -663,26 +655,31 @@ class program {
         return -1;
     }
 
-    // ── bitmask fast path ────────────────────────────────────────────────────
-    // eligible: unary head, exactly 1 EDB body, all other body atoms unary IDB
-    bool can_fast(const rule_def& r) const {
-        auto* h = idb(r.head);
-        if (!h || !h->unary) return false;
-        int ec = 0;
-        for (auto& a : r.body) {
-            if (edb(a.rel)) ++ec;
-            else { auto* p = idb(a.rel); if (!p || !p->unary) return false; }
-        }
-        return ec == 1;
-    }
-
-    void fire_fast(const rule_def& rule, const std::string* dr,
-                   const mask_t* db, mask_t& out) {
+    void fire(const rule_def& rule, const std::string* dr, const mask_t* db, mask_t& out) {
         size_t ei = SIZE_MAX;
         for (size_t i = 0; i < rule.body.size(); ++i)
             if (edb(rule.body[i].rel)) { ei = i; break; }
-        if (ei == SIZE_MAX) return;
 
+        if (ei == SIZE_MAX) {
+            // Pure IDB rule (0 EDBs) - Bitwise intersection
+            if (rule.body.empty()) return;
+            size_t w = out.size();
+            mask_t res(w, ~0ULL);
+            for (auto& ba : rule.body) {
+                auto* p = idb(ba.rel);
+                if (!p) continue;
+                const mask_t& b = (dr && ba.rel == *dr && db) ? *db : p->mask;
+                if (ba.negated) {
+                    for (size_t i = 0; i < w; ++i) res[i] &= ~b[i];
+                } else {
+                    for (size_t i = 0; i < w; ++i) res[i] &= b[i];
+                }
+            }
+            for (size_t i = 0; i < w; ++i) out[i] |= res[i];
+            return;
+        }
+
+        // 1-EDB rule
         auto& ea = rule.body[ei];
         auto* ed = edb(ea.rel);
         const table& t = *ed->tbl;
@@ -700,7 +697,7 @@ class program {
             if (i == ei) continue;
             auto& ba = rule.body[i];
             auto* p = idb(ba.rel);
-            if (!p || !p->unary) continue;
+            if (!p) continue;
 
             const mask_t& b = (dr && ba.rel == *dr && db) ? *db : p->mask;
             int ec = shared_edb_col(ea, ba);
@@ -729,128 +726,6 @@ class program {
                 bits::set(out, pcol[r]);
     }
 
-    // ── general nested-loop join ─────────────────────────────────────────────
-    struct output {
-        mask_t* ubits = nullptr;
-        std::vector<std::vector<uint32_t>>* cols = nullptr;
-        size_t* nrows = nullptr;
-        std::unordered_set<std::vector<uint32_t>, tuple_hash>* seen = nullptr;
-        const std::vector<std::string>* hvars = nullptr;
-    };
-
-    void emit(const env_t& env, const output& o) {
-        if (o.ubits) {
-            auto* p = lookup(env, (*o.hvars)[0]);
-            if (p) bits::set(*o.ubits, *p);
-        } else if (o.cols) {
-            std::vector<uint32_t> t(o.hvars->size());
-            for (size_t i = 0; i < t.size(); ++i) {
-                auto* p = lookup(env, (*o.hvars)[i]);
-                t[i] = p ? *p : 0;
-            }
-            if (o.seen->insert(t).second) {
-                for (size_t c = 0; c < t.size(); ++c) (*o.cols)[c].push_back(t[c]);
-                ++(*o.nrows);
-            }
-        }
-    }
-
-    void njoin(const rule_def& rule, const std::vector<size_t>& order, size_t pos,
-               env_t& env, const std::string* dr, const mask_t* db,
-               const std::vector<std::vector<uint32_t>>* dc, size_t dnr,
-               const output& out) {
-        if (pos == order.size()) { emit(env, out); return; }
-
-        size_t ai = order[pos];
-        auto& a = rule.body[ai];
-        bool use_d = dr && a.rel == *dr && !a.negated;
-
-        auto try_row = [&](auto get_val, size_t nc) {
-            size_t orig = env.size();
-            bool ok = true;
-            for (size_t c = 0; c < nc && ok; ++c) {
-                uint32_t v = get_val(c);
-                auto* p = lookup(env, a.vars[c]);
-                if (p) { if (*p != v) ok = false; }
-                else env.emplace_back(a.vars[c], v);
-            }
-            if (ok) njoin(rule, order, pos + 1, env, dr, db, dc, dnr, out);
-            env.resize(orig);
-        };
-
-        if (auto* ed = edb(a.rel)) {
-            const table& t = *ed->tbl;
-            size_t n = t.rows;
-            int bc = -1; uint32_t bv = 0;
-            for (size_t c = 0; c < a.vars.size(); ++c) {
-                auto* p = lookup(env, a.vars[c]);
-                if (p) { bc = (int)c; bv = *p; break; }
-            }
-            mask_t fm;
-            if (rule.filter && rule.filter_body == ai) fm = rule.filter(t);
-
-            for (size_t r = 0; r < n; ++r) {
-                if (!fm.empty() && !(fm[r / 64] & (1ULL << (r % 64)))) continue;
-                if (bc >= 0 && t.get_col(ed->cols[bc]).u32[r] != bv) continue;
-                try_row([&](size_t c) { return t.get_col(ed->cols[c]).u32[r]; },
-                        a.vars.size());
-            }
-        } else if (auto* p = idb(a.rel)) {
-            if (p->unary) {
-                const mask_t& b = (use_d && db) ? *db : p->mask;
-                auto* bound = lookup(env, a.vars[0]);
-                if (a.negated) {
-                    if (bound && !bits::test(b, *bound))
-                        njoin(rule, order, pos + 1, env, dr, db, dc, dnr, out);
-                } else if (bound) {
-                    if (bits::test(b, *bound))
-                        njoin(rule, order, pos + 1, env, dr, db, dc, dnr, out);
-                } else {
-                    for (size_t v = 0; v < p->universe; ++v) {
-                        if (!bits::test(b, v)) continue;
-                        size_t orig = env.size();
-                        env.emplace_back(a.vars[0], (uint32_t)v);
-                        njoin(rule, order, pos + 1, env, dr, db, dc, dnr, out);
-                        env.resize(orig);
-                    }
-                }
-            } else {
-                auto& cs = (use_d && dc) ? *dc : p->data;
-                size_t nr = (use_d && dc) ? dnr : p->nrows;
-                int bc = -1; uint32_t bv = 0;
-                for (size_t c = 0; c < a.vars.size(); ++c) {
-                    auto* q = lookup(env, a.vars[c]);
-                    if (q) { bc = (int)c; bv = *q; break; }
-                }
-                for (size_t r = 0; r < nr; ++r) {
-                    if (bc >= 0 && cs[bc][r] != bv) continue;
-                    try_row([&](size_t c) { return cs[c][r]; }, a.vars.size());
-                }
-            }
-        }
-    }
-
-    void fire_general(const rule_def& rule, const std::string* dr,
-                      const mask_t* db,
-                      const std::vector<std::vector<uint32_t>>* dc, size_t dnr,
-                      const output& out) {
-        std::vector<size_t> order;
-        if (dr)
-            for (size_t i = 0; i < rule.body.size(); ++i)
-                if (rule.body[i].rel == *dr && !rule.body[i].negated)
-                    { order.push_back(i); break; }
-        for (size_t i = 0; i < rule.body.size(); ++i)
-            if (std::find(order.begin(), order.end(), i) == order.end()
-                && edb(rule.body[i].rel))
-                order.push_back(i);
-        for (size_t i = 0; i < rule.body.size(); ++i)
-            if (std::find(order.begin(), order.end(), i) == order.end())
-                order.push_back(i);
-        env_t env;
-        njoin(rule, order, 0, env, dr, db, dc, dnr, out);
-    }
-
-    // ── stratification ───────────────────────────────────────────────────────
     struct stratum_t { std::vector<size_t> rule_ids; };
 
     std::vector<stratum_t> stratify() {
@@ -884,14 +759,6 @@ class program {
         return false;
     }
 
-    output make_output(const rule_def& r, idb_entry& h) {
-        output o; o.hvars = &r.head_vars;
-        if (h.unary) o.ubits = &h.mask;
-        else { o.cols = &h.data; o.nrows = &h.nrows; o.seen = &h.seen; }
-        return o;
-    }
-
-    // ── stratum evaluation ───────────────────────────────────────────────────
     void eval_stratum(stratum_t& s) {
         std::vector<size_t> base, rec;
         for (size_t ri : s.rule_ids)
@@ -899,8 +766,7 @@ class program {
 
         for (size_t ri : base) {
             auto& r = rules_[ri]; auto* h = idb(r.head);
-            if (can_fast(r)) fire_fast(r, nullptr, nullptr, h->mask);
-            else fire_general(r, nullptr, nullptr, nullptr, 0, make_output(r, *h));
+            fire(r, nullptr, nullptr, h->mask);
         }
         if (rec.empty()) return;
 
@@ -911,28 +777,13 @@ class program {
                 if (!a.negated && idb(a.rel)) inv.insert(a.rel);
         }
 
-        struct delta_t { mask_t bits; std::vector<std::vector<uint32_t>> cols; size_t nrows = 0; };
-        std::unordered_map<std::string, delta_t> deltas;
-        for (auto& nm : inv) {
-            auto* p = idb(nm); delta_t d;
-            if (p->unary) d.bits = p->mask;
-            else { d.cols = p->data; d.nrows = p->nrows; }
-            deltas[nm] = std::move(d);
-        }
+        std::unordered_map<std::string, mask_t> deltas;
+        for (auto& nm : inv) deltas[nm] = idb(nm)->mask;
 
         for (bool any_new = true; any_new;) {
             any_new = false;
-
-            std::unordered_map<std::string, delta_t> accum;
-            std::unordered_map<std::string,
-                std::unordered_set<std::vector<uint32_t>, tuple_hash>> acc_seen;
-            for (auto& nm : inv) {
-                auto* p = idb(nm); delta_t a;
-                if (p->unary) a.bits.resize(p->mask.size(), 0);
-                else a.cols.resize(p->col_names.size());
-                accum[nm] = std::move(a);
-                if (!p->unary) acc_seen[nm];
-            }
+            std::unordered_map<std::string, mask_t> accum;
+            for (auto& nm : inv) accum[nm].resize(idb(nm)->mask.size(), 0);
 
             for (size_t ri : rec) {
                 auto& rule = rules_[ri];
@@ -940,49 +791,19 @@ class program {
                     if (ba.negated || !idb(ba.rel)) continue;
                     std::string dn = ba.rel;
                     auto& d = deltas[dn];
-                    auto* hi = idb(rule.head);
-                    auto* di = idb(dn);
-
-                    if (can_fast(rule) && hi->unary && di->unary) {
-                        fire_fast(rule, &dn, &d.bits, accum[rule.head].bits);
-                    } else {
-                        auto& ac = accum[rule.head];
-                        output o; o.hvars = &rule.head_vars;
-                        if (hi->unary) {
-                            o.ubits = &ac.bits;
-                        } else {
-                            o.cols = &ac.cols; o.nrows = &ac.nrows;
-                            o.seen = &acc_seen[rule.head];
-                        }
-                        fire_general(rule, &dn,
-                                     di->unary ? &d.bits : nullptr,
-                                     di->unary ? nullptr : &d.cols, d.nrows, o);
-                    }
+                    fire(rule, &dn, &d, accum[rule.head]);
                     break;
                 }
             }
 
             for (auto& nm : inv) {
                 auto* p = idb(nm); auto& ac = accum[nm];
-                if (p->unary) {
-                    for (size_t w = 0; w < ac.bits.size(); ++w) ac.bits[w] &= ~p->mask[w];
-                    if (bits::any(ac.bits)) {
-                        any_new = true;
-                        for (size_t w = 0; w < ac.bits.size(); ++w) p->mask[w] |= ac.bits[w];
-                    }
-                    deltas[nm].bits = std::move(ac.bits);
-                } else {
-                    delta_t nd; nd.cols.resize(p->col_names.size());
-                    for (size_t r = 0; r < ac.nrows; ++r) {
-                        std::vector<uint32_t> t(p->col_names.size());
-                        for (size_t c = 0; c < t.size(); ++c) t[c] = ac.cols[c][r];
-                        if (p->insert(t)) {
-                            for (size_t c = 0; c < t.size(); ++c) nd.cols[c].push_back(t[c]);
-                            ++nd.nrows; any_new = true;
-                        }
-                    }
-                    deltas[nm] = std::move(nd);
+                for (size_t w = 0; w < ac.size(); ++w) ac[w] &= ~p->mask[w];
+                if (bits::any(ac)) {
+                    any_new = true;
+                    for (size_t w = 0; w < ac.size(); ++w) p->mask[w] |= ac[w];
                 }
+                deltas[nm] = std::move(ac);
             }
         }
     }
@@ -992,78 +813,34 @@ public:
         edbs_.push_back({std::move(name), &t, std::move(cols)});
     }
     void add_idb(std::string name, size_t universe) {
-        idb_entry e;
-        e.name = std::move(name); e.unary = true; e.universe = universe;
-        e.mask.resize(bits::words(universe), 0); e.nrows = 0;
-        idbs_.push_back(std::move(e));
-    }
-    void add_idb_table(std::string name, std::vector<std::string> cols) {
-        idb_entry e;
-        e.name = std::move(name); e.unary = false; e.universe = 0;
-        e.col_names = std::move(cols); e.data.resize(e.col_names.size()); e.nrows = 0;
+        idb_entry e; e.name = std::move(name); e.universe = universe;
+        e.mask.resize(bits::words(universe), 0);
         idbs_.push_back(std::move(e));
     }
     void add_rule(rule_def r) { rules_.push_back(std::move(r)); }
     void evaluate() { auto ss = stratify(); for (auto& s : ss) eval_stratum(s); }
 
     const mask_t& get_bits(const std::string& n) const { return idb(n)->mask; }
-    struct store_view {
-        size_t nrows, arity;
-        const std::vector<std::vector<uint32_t>>& cols;
-    };
-    store_view get_store(const std::string& n) const {
-        auto* p = idb(n);
-        return {p->nrows, p->col_names.size(), p->data};
-    }
 };
 
 } // namespace datalog
 
 namespace {
-
-table make_nodes(size_t n) {
-    return table(n); // constructor creates "id" = {0..n-1} and "mask"
-}
-
+table make_nodes(size_t n) { return table(n); }
 table make_edges(std::vector<std::pair<uint32_t, uint32_t>> es) {
-    size_t n = es.size();
-    table t(n);
-    t.add_column_u32("src");
-    t.add_column_u32("dst");
-    auto& src = t.get_col("src").u32;
-    auto& dst = t.get_col("dst").u32;
+    size_t n = es.size(); table t(n);
+    t.add_column_u32("src"); t.add_column_u32("dst");
+    auto& src = t.get_col("src").u32; auto& dst = t.get_col("dst").u32;
     for (size_t i = 0; i < n; ++i) { src[i] = es[i].first; dst[i] = es[i].second; }
     return t;
 }
-
-table make_table(size_t n,
-                 std::initializer_list<std::pair<const char*, std::vector<uint32_t>>> extra) {
-    table t(n);
-    for (auto& [name, vals] : extra) {
-        t.add_column_u32(name);
-        t.get_col(name).u32 = vals;
-    }
-    return t;
-}
-
 bool bt(const engine::mask_t& m, size_t i) {
     return i / 64 < m.size() && (m[i / 64] & (1ULL << (i % 64)));
 }
 size_t popcnt(const engine::mask_t& m, size_t n) {
     size_t c = 0; for (size_t i = 0; i < n; ++i) c += bt(m, i); return c;
 }
-bool has_fact(const datalog::program::store_view& s, std::initializer_list<uint32_t> v) {
-    std::vector<uint32_t> t(v);
-    for (size_t r = 0; r < s.nrows; ++r) {
-        bool ok = true;
-        for (size_t c = 0; c < s.arity && ok; ++c)
-            if (s.cols[c][r] != t[c]) ok = false;
-        if (ok) return true;
-    }
-    return false;
 }
-
-} // namespace
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Tests
@@ -1515,120 +1292,46 @@ TEST(Datalog, ThreeStrata) {
     for (int i = 5; i < 10; ++i) EXPECT_FALSE(bt(p.get_bits("fin"), i));
 }
 
-TEST(Datalog, NaryBinaryPath) {
-    auto edges = make_edges({{0,1},{1,2},{2,3}});
-    datalog::program p;
-    p.add_edb("edge", edges, {"src","dst"});
-    p.add_idb_table("path", {"src","dst"});
-    p.add_rule({"path", {"X","Y"}, {{"edge", {"X","Y"}}}});
-    p.add_rule({"path", {"X","Y"}, {{"path", {"X","Z"}}, {"edge", {"Z","Y"}}}});
-    p.evaluate();
-    auto s = p.get_store("path");
-    EXPECT_EQ(s.nrows, 6u);
-    EXPECT_TRUE(has_fact(s, {0,1}));
-    EXPECT_TRUE(has_fact(s, {0,2}));
-    EXPECT_TRUE(has_fact(s, {0,3}));
-    EXPECT_TRUE(has_fact(s, {1,2}));
-    EXPECT_TRUE(has_fact(s, {1,3}));
-    EXPECT_TRUE(has_fact(s, {2,3}));
+TEST(Engine, HierarchyDict) {
+    table t(4);
+    t.add_column_hst("path", {"sensor/temp/1", "sensor/voltage", "motor/rpm", "sensor/temp/2"});
+    // Lexicographical order assigns IDs:
+    // motor/rpm       -> 0
+    // sensor/temp/1   -> 1
+    // sensor/temp/2   -> 2
+    // sensor/voltage  -> 3
+    
+    auto q1 = field_hst<"path", "sensor">();
+    auto r1 = engine::execute(t, q1);
+    EXPECT_FALSE(simd::test(r1.data(), 2)); // motor
+    EXPECT_TRUE(simd::test(r1.data(), 0));  // sensor/temp/1
+    EXPECT_TRUE(simd::test(r1.data(), 3));  // sensor/temp/2
+    EXPECT_TRUE(simd::test(r1.data(), 1));  // sensor/voltage
+    
+    auto q2 = field_hst<"path", "sensor/temp">();
+    auto r2 = engine::execute(t, q2);
+    EXPECT_TRUE(simd::test(r2.data(), 0));  // sensor/temp/1
+    EXPECT_TRUE(simd::test(r2.data(), 3));  // sensor/temp/2
+    EXPECT_FALSE(simd::test(r2.data(), 1)); // sensor/voltage
 }
 
-TEST(Datalog, NaryPathCycle) {
-    auto edges = make_edges({{0,1},{1,2},{2,0}});
+TEST(Datalog, PureIDBIntersection) {
+    auto nodes = make_nodes(5);
     datalog::program p;
-    p.add_edb("edge", edges, {"src","dst"});
-    p.add_idb_table("path", {"src","dst"});
-    p.add_rule({"path", {"X","Y"}, {{"edge", {"X","Y"}}}});
-    p.add_rule({"path", {"X","Y"}, {{"path", {"X","Z"}}, {"edge", {"Z","Y"}}}});
+    p.add_edb("nodes", nodes, {"id"});
+    p.add_idb("A", 5); p.add_idb("B", 5); p.add_idb("C", 5);
+    p.add_rule({"A", {"X"}, {{"nodes", {"X"}}}, [](const table& t){ return engine::execute(t, field_matcher<op::lt, "id", 4>{}); }, 0});
+    p.add_rule({"B", {"X"}, {{"nodes", {"X"}}}, [](const table& t){ return engine::execute(t, field_matcher<op::ge, "id", 2>{}); }, 0});
+    // C(X) :- A(X), B(X)  -> No EDB!
+    p.add_rule({"C", {"X"}, {{"A", {"X"}}, {"B", {"X"}}}});
     p.evaluate();
-    auto s = p.get_store("path");
-    EXPECT_EQ(s.nrows, 9u);
-    for (uint32_t i = 0; i < 3; ++i)
-        for (uint32_t j = 0; j < 3; ++j)
-            EXPECT_TRUE(has_fact(s, {i, j})) << "(" << i << "," << j << ")";
+    
+    EXPECT_FALSE(bt(p.get_bits("C"), 1));
+    EXPECT_TRUE(bt(p.get_bits("C"), 2));
+    EXPECT_TRUE(bt(p.get_bits("C"), 3));
+    EXPECT_FALSE(bt(p.get_bits("C"), 4));
 }
 
-TEST(Datalog, NaryDedup) {
-    auto edges = make_edges({{0,1},{0,1},{0,1}});
-    datalog::program p;
-    p.add_edb("edge", edges, {"src","dst"});
-    p.add_idb_table("u", {"a","b"});
-    p.add_rule({"u", {"X","Y"}, {{"edge", {"X","Y"}}}});
-    p.evaluate();
-    EXPECT_EQ(p.get_store("u").nrows, 1u);
-}
-
-TEST(Datalog, Projection) {
-    auto edges = make_edges({{0,1},{0,2},{1,3}});
-    datalog::program p;
-    p.add_edb("edge", edges, {"src","dst"});
-    p.add_idb_table("proj", {"x"});
-    p.add_rule({"proj", {"X"}, {{"edge", {"X","Y"}}}});
-    p.evaluate();
-    auto s = p.get_store("proj");
-    EXPECT_EQ(s.nrows, 2u);
-    EXPECT_TRUE(has_fact(s, {0}));
-    EXPECT_TRUE(has_fact(s, {1}));
-}
-
-TEST(Datalog, TwoTableJoin) {
-    auto r1 = make_table(3, {{"a", {0,1,2}}, {"b", {10,20,30}}});
-    auto r2 = make_table(3, {{"b", {10,20,30}}, {"c", {100,200,300}}});
-    datalog::program p;
-    p.add_edb("R", r1, {"a","b"});
-    p.add_edb("S", r2, {"b","c"});
-    p.add_idb_table("T", {"x","y"});
-    p.add_rule({"T", {"A","C"}, {{"R",{"A","B"}}, {"S",{"B","C"}}}});
-    p.evaluate();
-    auto s = p.get_store("T");
-    EXPECT_EQ(s.nrows, 3u);
-    EXPECT_TRUE(has_fact(s, {0, 100}));
-    EXPECT_TRUE(has_fact(s, {1, 200}));
-    EXPECT_TRUE(has_fact(s, {2, 300}));
-}
-
-TEST(Datalog, TwoTablePartialJoin) {
-    auto r1 = make_table(3, {{"a", {0,1,2}}, {"b", {10,20,30}}});
-    auto r2 = make_table(2, {{"b", {20,40}}, {"c", {200,400}}});
-    datalog::program p;
-    p.add_edb("R", r1, {"a","b"});
-    p.add_edb("S", r2, {"b","c"});
-    p.add_idb_table("T", {"x","y"});
-    p.add_rule({"T", {"A","C"}, {{"R",{"A","B"}}, {"S",{"B","C"}}}});
-    p.evaluate();
-    auto s = p.get_store("T");
-    EXPECT_EQ(s.nrows, 1u);
-    EXPECT_TRUE(has_fact(s, {1, 200}));
-}
-
-TEST(Datalog, SelfJoin) {
-    auto edges = make_edges({{0,1},{1,2},{2,3}});
-    datalog::program p;
-    p.add_edb("edge", edges, {"src","dst"});
-    p.add_idb_table("p2", {"a","b"});
-    p.add_rule({"p2", {"A","C"}, {{"edge",{"A","B"}}, {"edge",{"B","C"}}}});
-    p.evaluate();
-    auto s = p.get_store("p2");
-    EXPECT_EQ(s.nrows, 2u);
-    EXPECT_TRUE(has_fact(s, {0, 2}));
-    EXPECT_TRUE(has_fact(s, {1, 3}));
-}
-
-TEST(Datalog, ThreeWayJoin) {
-    auto r1 = make_table(2, {{"a", {1,2}}, {"b", {10,20}}});
-    auto r2 = make_table(3, {{"b", {10,20,30}}, {"c", {100,200,300}}});
-    auto r3 = make_table(2, {{"c", {100,300}}, {"d", {1000,3000}}});
-    datalog::program p;
-    p.add_edb("R", r1, {"a","b"});
-    p.add_edb("S", r2, {"b","c"});
-    p.add_edb("T", r3, {"c","d"});
-    p.add_idb_table("result", {"x","y"});
-    p.add_rule({"result", {"A","D"}, {{"R",{"A","B"}}, {"S",{"B","C"}}, {"T",{"C","D"}}}});
-    p.evaluate();
-    auto s = p.get_store("result");
-    EXPECT_EQ(s.nrows, 1u);
-    EXPECT_TRUE(has_fact(s, {1, 1000}));
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Benchmarks
@@ -1720,23 +1423,6 @@ static void BM_Datalog_DenseTC(benchmark::State& st) {
 }
 BENCHMARK(BM_Datalog_DenseTC);
 
-static void BM_Datalog_NaryPath(benchmark::State& st) {
-    size_t n = st.range(0);
-    std::vector<std::pair<uint32_t,uint32_t>> es;
-    for (uint32_t i = 0; i < n; ++i) es.push_back({i, i + 1});
-    auto edges = make_edges(std::move(es));
-    for (auto _ : st) {
-        datalog::program p;
-        p.add_edb("edge", edges, {"src","dst"});
-        p.add_idb_table("path", {"src","dst"});
-        p.add_rule({"path", {"X","Y"}, {{"edge", {"X","Y"}}}});
-        p.add_rule({"path", {"X","Y"}, {{"path", {"X","Z"}}, {"edge", {"Z","Y"}}}});
-        p.evaluate();
-        benchmark::DoNotOptimize(p.get_store("path").nrows);
-    }
-}
-BENCHMARK(BM_Datalog_NaryPath)->Arg(10)->Arg(20)->Arg(50)->Arg(100);
-
 static void BM_Datalog_Negation(benchmark::State& st) {
     size_t n = st.range(0);
     auto nodes = make_nodes(n);
@@ -1758,23 +1444,18 @@ static void BM_Datalog_Negation(benchmark::State& st) {
 }
 BENCHMARK(BM_Datalog_Negation)->RangeMultiplier(10)->Range(1000, 100'000);
 
-static void BM_Datalog_MultiJoin(benchmark::State& st) {
-    size_t n = st.range(0);
-    std::vector<uint32_t> a(n), b(n), c(n);
-    for (uint32_t i = 0; i < n; ++i) { a[i] = i; b[i] = i + (uint32_t)n; c[i] = i + 2*(uint32_t)n; }
-    auto r1 = make_table(n, {{"a", a}, {"b", b}});
-    auto r2 = make_table(n, {{"b", b}, {"c", c}});
-    for (auto _ : st) {
-        datalog::program p;
-        p.add_edb("R", r1, {"a","b"}); p.add_edb("S", r2, {"b","c"});
-        p.add_idb_table("T", {"x","y"});
-        p.add_rule({"T", {"A","C"}, {{"R",{"A","B"}}, {"S",{"B","C"}}}});
-        p.evaluate();
-        benchmark::DoNotOptimize(p.get_store("T").nrows);
+static void BM_Execute_HST(benchmark::State& st) {
+    table t(st.range(0));
+    std::vector<std::string> paths(st.range(0));
+    for (size_t i=0;i<st.range(0);++i) {
+        paths[i] = (i % 2 == 0) ? "sensor/temp/a" : "motor/rpm/b";
     }
-    st.SetItemsProcessed(st.iterations() * (int64_t)n);
+    t.add_column_hst("path", paths);
+    auto q = field_hst<"path", "sensor">{};
+    for (auto _:st) benchmark::DoNotOptimize(engine::execute(t,q));
+    st.SetItemsProcessed(st.range(0)*st.iterations());
 }
-BENCHMARK(BM_Datalog_MultiJoin)->RangeMultiplier(10)->Range(100, 10'000);
+BENCHMARK(BM_Execute_HST)->RangeMultiplier(10)->Range(1000,1000000);
 
 #define RUN_BENCHMARKS 1
 #if RUN_BENCHMARKS
