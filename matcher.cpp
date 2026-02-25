@@ -93,7 +93,6 @@ template<matcher L, matcher R> struct or_t {
 };
 template<matcher L, matcher R> or_t(L, R) -> or_t<L, R>;
 
-// ── Type traits ──
 template<typename>   struct is_not_i : std::false_type {};
 template<matcher M>  struct is_not_i<not_t<M>> : std::true_type {};
 template<typename>   struct is_and_i : std::false_type {};
@@ -105,14 +104,13 @@ template<typename T> inline constexpr bool is_not_v = is_not_i<std::remove_cvref
 template<typename T> inline constexpr bool is_and_v = is_and_i<std::remove_cvref_t<T>>::value;
 template<typename T> inline constexpr bool is_or_v  = is_or_i <std::remove_cvref_t<T>>::value;
 
-// Runtime bitmap matcher (semi-join result)
+// Runtime bitmap matcher
 struct field_in {
     using is_matcher = void;
     std::string_view field;
     std::shared_ptr<std::vector<uint64_t>> bitmap;
 };
 
-// Static matcher trait — gates constexpr simplification in operators
 template<typename T>             inline constexpr bool is_static_v = true;
 template<>                       inline constexpr bool is_static_v<field_in> = false;
 template<typename M>             inline constexpr bool is_static_v<not_t<M>>    = is_static_v<M>;
@@ -120,9 +118,8 @@ template<typename L, typename R> inline constexpr bool is_static_v<and_t<L,R>> =
 template<typename L, typename R> inline constexpr bool is_static_v<or_t<L,R>>  = is_static_v<L> && is_static_v<R>;
 
 // ── CPO: implies ──
-// Structural rules inline; leaf rules via tag_invoke.
-// NEW vs previous: Or⟹M rule + contrapositive, all inside the CPO body
-// to avoid tag_invoke overload ambiguity.
+// Structural rules: never, always, And, Or-on-RHS, Or-on-LHS, contrapositive.
+// Leaf rules dispatched via tag_invoke.
 constexpr inline class implies_t {
 public:
     template<typename L, typename R>
@@ -143,6 +140,7 @@ public:
 } implies{};
 
 // ── CPO: negate ──
+// Matches Python: wraps And/Or in not_t (no De Morgan distribution).
 constexpr inline class negate_t {
 public:
     template<typename M>
@@ -156,13 +154,11 @@ public:
     }
 } negate{};
 
-// Forward declarations — operators and simplify are mutually recursive
 template<matcher L, matcher R> constexpr auto operator&(L l, R r);
 template<matcher L, matcher R> constexpr auto operator|(L l, R r);
 
 // ── CPO: simplify ──
-// NEW: handles and_t/or_t by recursively simplifying children then
-// re-applying operators, which triggers all subsumption/contradiction rules.
+// Recurses into and_t/or_t then re-applies operators for subsumption.
 constexpr inline class simplify_t {
 public:
     template<typename M>
@@ -178,7 +174,10 @@ public:
     }
 } simplify{};
 
-// ── CPO: sum_of_products (DNF via distributive law) ──
+// ── CPO: sum_of_products (DNF) ──
+// De Morgan is applied here (not in negate) so that DNF conversion
+// pushes negation to leaves. This goes beyond Python parity but is
+// strictly correct and enables extract_bits on distributed results.
 constexpr inline class sum_of_products_t {
 public:
     template<typename M>
@@ -187,9 +186,9 @@ public:
         using S = decltype(s);
         if constexpr (is_not_v<S>) {
             using Inner = std::remove_cvref_t<decltype(s.m)>;
-            if constexpr (is_and_v<Inner>)       // De Morgan: !(A&B) → !A | !B
+            if constexpr (is_and_v<Inner>)
                 return or_t{(*this)(negate(s.m.lhs)), (*this)(negate(s.m.rhs))};
-            else if constexpr (is_or_v<Inner>)   // De Morgan: !(A|B) → !A & !B
+            else if constexpr (is_or_v<Inner>)
                 return (*this)(and_t{(*this)(negate(s.m.lhs)), (*this)(negate(s.m.rhs))});
             else return s;
         }
@@ -199,10 +198,10 @@ public:
             auto l = (*this)(s.lhs);
             auto r = (*this)(s.rhs);
             using LS = decltype(l); using RS = decltype(r);
-            if constexpr (is_or_v<LS>)           // (A|B)&C → (A&C)|(B&C)
+            if constexpr (is_or_v<LS>)
                 return or_t{(*this)(and_t<typename LS::lhs_t, RS>{l.lhs, r}),
                              (*this)(and_t<typename LS::rhs_t, RS>{l.rhs, r})};
-            else if constexpr (is_or_v<RS>)      // A&(B|C) → (A&B)|(A&C)
+            else if constexpr (is_or_v<RS>)
                 return or_t{(*this)(and_t<LS, typename RS::lhs_t>{l, r.lhs}),
                              (*this)(and_t<LS, typename RS::rhs_t>{l, r.rhs})};
             else return and_t<LS, RS>{l, r};
@@ -276,10 +275,11 @@ struct field_matcher {
             if constexpr      (O2==op::eq) return Val==V2;
             else if constexpr (O2==op::ne) return Val!=V2;
             else if constexpr (O2==op::lt) return Val< V2;
-            else                           return Val>=V2;  // ge
+            else                           return Val>=V2;
         }
         else if constexpr (O == op::lt) {
-            if constexpr (O2==op::lt || O2==op::ne) return Val<=V2;
+            if constexpr      (O2==op::lt) return Val<=V2;
+            else if constexpr (O2==op::ne) return Val<=V2;
             else return false;
         }
         else if constexpr (O == op::ge) {
@@ -419,7 +419,8 @@ struct engine {
     }
 
 private:
-    // ── Extract required mask bits from AND chains for bloom skip ──
+    // ── Extract required mask bits for bloom-filter chunk skipping ──
+
     template<typename M>
     static uint64_t extract_bits(M const&) { return 0; }
 
@@ -429,9 +430,19 @@ private:
             return static_cast<uint64_t>(Val);
         else return 0;
     }
+
     template<match::matcher L, match::matcher R>
     static uint64_t extract_bits(match::and_t<L,R> const& a) {
         return extract_bits(a.lhs) | extract_bits(a.rhs);
+    }
+
+    // For DNF (top-level or_t): intersect children's required bits.
+    // A chunk can only be skipped if BOTH branches are impossible.
+    template<match::matcher L, match::matcher R>
+    static uint64_t extract_bits(match::or_t<L,R> const& o) {
+        auto l = extract_bits(o.lhs);
+        auto r = extract_bits(o.rhs);
+        return (l && r) ? (l & r) : 0;
     }
 
     // ── Aggregate reduction ──
@@ -533,8 +544,6 @@ private:
 
 using namespace match;
 
-// ── Compile-Time Algebra ──
-
 TEST(Algebra, SubsumptionAndRedundancy) {
     using lt10 = field_matcher<op::lt, "x", 10>;
     using lt20 = field_matcher<op::lt, "x", 20>;
@@ -554,31 +563,24 @@ TEST(Algebra, ContradictionAndTautology) {
 }
 
 TEST(Algebra, FullImplicationTable) {
-    // Lt → Ne: x<10 ⟹ x≠40  (10 ≤ 40)
     using lt10 = field_matcher<op::lt, "x", 10>;
     using ne40 = field_matcher<op::ne, "x", 40>;
     static_assert(std::is_same_v<decltype(lt10{} & ne40{}), lt10>);
 
-    // Ge → Ne: x≥50 ⟹ x≠10  (50 > 10)
     using ge50 = field_matcher<op::ge, "x", 50>;
     using ne10 = field_matcher<op::ne, "x", 10>;
     static_assert(std::is_same_v<decltype(ge50{} & ne10{}), ge50>);
 
-    // Ne → Ne: identity only
     using ne5a = field_matcher<op::ne, "x", 5>;
     using ne5b = field_matcher<op::ne, "x", 5>;
     static_assert(std::is_same_v<decltype(ne5a{} & ne5b{}), ne5a>);
 
-    // Eq subsumption
     using eq15 = field_matcher<op::eq, "x", 15>;
     using lt20 = field_matcher<op::lt, "x", 20>;
     static_assert(std::is_same_v<decltype(eq15{} & lt20{}), eq15>);
 
-    // Range tautology: (x<20)|(x≥10) → always  since ¬(x<20)=x≥20, x≥20⟹x≥10
     using ge10 = field_matcher<op::ge, "x", 10>;
     static_assert(std::is_same_v<decltype(lt20{} | ge10{}), always_t>);
-
-    // Overlapping ranges stay as And
     static_assert(is_and_v<decltype(lt20{} & ge10{})>);
 }
 
@@ -587,14 +589,12 @@ TEST(Algebra, OrImpliesM) {
     using eq3  = field_matcher<op::eq, "x", 3>;
     using lt10 = field_matcher<op::lt, "x", 10>;
 
-    // Both eq5 and eq3 imply lt10 → (eq5|eq3) ⟹ lt10
-    // So (eq5|eq3) & lt10 → (eq5|eq3)
+    // Both eq5 and eq3 imply lt10 → (eq5|eq3) & lt10 simplifies to (eq5|eq3)
     auto result = (eq5{} | eq3{}) & lt10{};
     static_assert(std::is_same_v<decltype(result), or_t<eq5, eq3>>);
 }
 
 TEST(Algebra, Contrapositive) {
-    // field_hst has no leaf-swap negate → produces not_t
     using parent = field_hst<"type", "sensor">;
     using child  = field_hst<"type", "sensor/temp">;
 
@@ -602,7 +602,7 @@ TEST(Algebra, Contrapositive) {
     auto neg_child  = !child{};
     static_assert(is_not_v<decltype(neg_parent)>);
 
-    // child ⟹ parent, so by contrapositive: ¬parent ⟹ ¬child
+    // child ⟹ parent, so by contrapositive ¬parent ⟹ ¬child
     static_assert( implies(neg_parent, neg_child));
     static_assert(!implies(neg_child, neg_parent));
 
@@ -615,7 +615,7 @@ TEST(Algebra, SimplifyRecursion) {
     using eq5  = field_matcher<op::eq, "x", 5>;
     using lt10 = field_matcher<op::lt, "x", 10>;
 
-    // Raw and_t (not built through operator&) must still simplify
+    // Raw and_t/or_t (not built through operators) must still simplify
     auto raw_and = and_t{eq5{}, lt10{}};
     static_assert(is_and_v<decltype(raw_and)>);
     static_assert(std::is_same_v<decltype(simplify(raw_and)), eq5>);
@@ -629,12 +629,10 @@ TEST(Algebra, SumOfProducts) {
     using B = field_matcher<op::eq, "y", 2>;
     using C = field_matcher<op::eq, "z", 3>;
 
-    // (A|B) & C distributes to (A&C)|(B&C)
     auto expr = and_t{or_t{A{}, B{}}, C{}};
     auto dnf = sum_of_products(expr);
     static_assert(is_or_v<decltype(dnf)>);
 
-    // A & (A|B) simplifies to A without distribution
     auto absorb = and_t{A{}, or_t{A{}, B{}}};
     static_assert(std::is_same_v<decltype(sum_of_products(absorb)), A>);
 }
@@ -737,6 +735,20 @@ TEST(Engine, BloomFilterSkip) {
     auto q = field_matcher<op::eq,"mask",3>{} & field_matcher<op::lt,"dur",150>{};
     auto r = engine::execute(t, q);
     EXPECT_EQ(simd::popcount(r.data(), r.size()), 10u);
+}
+
+TEST(Engine, BloomFilterDNF) {
+    // After DNF, top-level or_t — bloom skip should still work via
+    // extract_bits intersecting both branches' required mask bits.
+    table t(10240, 1024);
+    t.add_column_u32("dur", 100); t.add_column_u32("sp", 0);
+    for (int i = 0; i < 5; ++i) { t.set_tag(i, 0); t.set_tag(i, 1); }
+    auto q = or_t{
+        and_t{field_matcher<op::eq,"mask",3>{}, field_matcher<op::lt,"dur",150>{}},
+        and_t{field_matcher<op::eq,"mask",3>{}, field_matcher<op::eq,"sp",0>{}}
+    };
+    auto r = engine::execute(t, q);
+    EXPECT_EQ(simd::popcount(r.data(), r.size()), 5u);
 }
 
 TEST(Engine, Contradiction) {
