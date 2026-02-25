@@ -3,7 +3,6 @@
 #include <cassert>
 #include <concepts>
 #include <cstdint>
-#include <iostream>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -15,7 +14,7 @@
 #include <benchmark/benchmark.h>
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Fixed-Size String for Non-Type Template Parameters
+// Fixed-Size String for NTTPs
 // ═══════════════════════════════════════════════════════════════════════════════
 
 template<size_t N>
@@ -31,13 +30,12 @@ struct fs {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SIMD Abstraction Layer — swap per-architecture
+// SIMD Abstraction Layer
 // ═══════════════════════════════════════════════════════════════════════════════
 
 namespace simd {
 
 using mask_t = std::vector<uint64_t>;
-
 inline size_t num_words(size_t bits) { return (bits + 63) / 64; }
 
 inline void band   (uint64_t* a, const uint64_t* b, size_t n) { for (size_t i=0;i<n;++i) a[i] &=  b[i]; }
@@ -95,147 +93,142 @@ template<matcher L, matcher R> struct or_t {
 };
 template<matcher L, matcher R> or_t(L, R) -> or_t<L, R>;
 
-// --- Type traits ---
-template<typename>   struct is_or_i  : std::false_type {};
+// ── Type traits ──
+template<typename>   struct is_not_i : std::false_type {};
+template<matcher M>  struct is_not_i<not_t<M>> : std::true_type {};
 template<typename>   struct is_and_i : std::false_type {};
-template<matcher L, matcher R> struct is_or_i <or_t<L,R>>  : std::true_type {};
 template<matcher L, matcher R> struct is_and_i<and_t<L,R>> : std::true_type {};
-template<typename T> inline constexpr bool is_or_v  = is_or_i <std::remove_cvref_t<T>>::value;
+template<typename>   struct is_or_i  : std::false_type {};
+template<matcher L, matcher R> struct is_or_i<or_t<L,R>>  : std::true_type {};
+
+template<typename T> inline constexpr bool is_not_v = is_not_i<std::remove_cvref_t<T>>::value;
 template<typename T> inline constexpr bool is_and_v = is_and_i<std::remove_cvref_t<T>>::value;
+template<typename T> inline constexpr bool is_or_v  = is_or_i <std::remove_cvref_t<T>>::value;
 
-// ---- CPOs ----
-
-struct implies_t {
-    template<typename L, typename R>
-    constexpr bool operator()(L const& l, R const& r) const {
-        if constexpr (requires { tag_invoke(*this, l, r); })
-            return tag_invoke(*this, l, r);
-        else
-            return std::is_same_v<std::remove_cvref_t<L>, std::remove_cvref_t<R>>;
-    }
-};
-inline constexpr implies_t implies;
-
-struct negate_t {
-    template<typename M>
-    constexpr auto operator()(M const& m) const {
-        if constexpr (requires { tag_invoke(*this, m); })
-            return tag_invoke(*this, m);
-        else
-            return not_t{m};
-    }
-};
-inline constexpr negate_t negate;
-
-struct simplify_t {
-    template<typename M>
-    constexpr auto operator()(M const& m) const {
-        if constexpr (requires { tag_invoke(*this, m); })
-            return tag_invoke(*this, m);
-        else
-            return m;
-    }
-};
-inline constexpr simplify_t simplify;
-
-struct sum_of_products_t {
-    template<typename M>
-    constexpr auto operator()(M const& m) const {
-        if constexpr (requires { tag_invoke(*this, m); })
-            return tag_invoke(*this, m);
-        else
-            return m;
-    }
-};
-inline constexpr sum_of_products_t sum_of_products;
-
-// ---- Structural rules: implies ----
-constexpr bool tag_invoke(implies_t, never_t, auto const&)  { return true; }
-constexpr bool tag_invoke(implies_t, auto const&, always_t) { return true; }
-constexpr bool tag_invoke(implies_t, always_t, never_t)     { return false; }
-
-template<matcher L, matcher R, matcher M>
-constexpr bool tag_invoke(implies_t, and_t<L,R> const& a, M const& m) {
-    return implies(a.lhs, m) || implies(a.rhs, m);
-}
-template<matcher M, matcher L, matcher R>
-constexpr bool tag_invoke(implies_t, M const& m, or_t<L,R> const& o) {
-    return implies(m, o.lhs) || implies(m, o.rhs);
-}
-
-// ---- Structural rules: negate ----
-constexpr never_t  tag_invoke(negate_t, always_t) { return {}; }
-constexpr always_t tag_invoke(negate_t, never_t)  { return {}; }
-template<matcher M> constexpr M tag_invoke(negate_t, not_t<M> const& n) { return n.m; }
-
-// ---- Structural rules: simplify ----
-template<matcher M>
-constexpr auto tag_invoke(simplify_t, not_t<M> const& n) { return negate(simplify(n.m)); }
-
-// ---- Structural rules: sum_of_products (DNF) ----
-template<matcher L, matcher R>
-constexpr auto tag_invoke(sum_of_products_t, or_t<L,R> const& m) {
-    return or_t{sum_of_products(m.lhs), sum_of_products(m.rhs)};
-}
-
-template<matcher L, matcher R>
-constexpr auto tag_invoke(sum_of_products_t, and_t<L,R> const& m) {
-    auto l = sum_of_products(m.lhs);
-    auto r = sum_of_products(m.rhs);
-    using LS = decltype(l); using RS = decltype(r);
-    if constexpr (is_or_v<LS>) {
-        return or_t{sum_of_products(and_t<typename LS::lhs_t, RS>{l.lhs, r}),
-                     sum_of_products(and_t<typename LS::rhs_t, RS>{l.rhs, r})};
-    } else if constexpr (is_or_v<RS>) {
-        return or_t{sum_of_products(and_t<LS, typename RS::lhs_t>{l, r.lhs}),
-                     sum_of_products(and_t<LS, typename RS::rhs_t>{l, r.rhs})};
-    } else {
-        return and_t<LS, RS>{l, r};
-    }
-}
-
-template<matcher M>
-constexpr auto tag_invoke(sum_of_products_t, not_t<M> const& n) {
-    if constexpr (is_and_v<M>)
-        return or_t{sum_of_products(negate(n.m.lhs)), sum_of_products(negate(n.m.rhs))};
-    else if constexpr (is_or_v<M>)
-        return sum_of_products(and_t{sum_of_products(negate(n.m.lhs)),
-                                      sum_of_products(negate(n.m.rhs))});
-    else return n;
-}
-
-// ---- Runtime bitmap matcher ----
+// Runtime bitmap matcher (semi-join result)
 struct field_in {
     using is_matcher = void;
     std::string_view field;
     std::shared_ptr<std::vector<uint64_t>> bitmap;
 };
 
-// ---- Static-matcher trait (gates compile-time simplification in operators) ----
-template<typename T>           inline constexpr bool is_static_v = true;
-template<>                     inline constexpr bool is_static_v<field_in> = false;
-template<typename M>           inline constexpr bool is_static_v<not_t<M>>    = is_static_v<M>;
-template<typename L,typename R>inline constexpr bool is_static_v<and_t<L,R>> = is_static_v<L> && is_static_v<R>;
-template<typename L,typename R>inline constexpr bool is_static_v<or_t<L,R>>  = is_static_v<L> && is_static_v<R>;
+// Static matcher trait — gates constexpr simplification in operators
+template<typename T>             inline constexpr bool is_static_v = true;
+template<>                       inline constexpr bool is_static_v<field_in> = false;
+template<typename M>             inline constexpr bool is_static_v<not_t<M>>    = is_static_v<M>;
+template<typename L, typename R> inline constexpr bool is_static_v<and_t<L,R>> = is_static_v<L> && is_static_v<R>;
+template<typename L, typename R> inline constexpr bool is_static_v<or_t<L,R>>  = is_static_v<L> && is_static_v<R>;
 
-// ---- Expression operators ----
+// ── CPO: implies ──
+// Structural rules inline; leaf rules via tag_invoke.
+// NEW vs previous: Or⟹M rule + contrapositive, all inside the CPO body
+// to avoid tag_invoke overload ambiguity.
+constexpr inline class implies_t {
+public:
+    template<typename L, typename R>
+    constexpr bool operator()(L const& l, R const& r) const {
+        using UL = std::remove_cvref_t<L>;
+        using UR = std::remove_cvref_t<R>;
+        if constexpr      (std::is_same_v<UL, never_t>)  return true;
+        else if constexpr (std::is_same_v<UR, always_t>)  return true;
+        else if constexpr (std::is_same_v<UL, always_t>)  return false;
+        else if constexpr (is_and_v<UL>)  return (*this)(l.lhs, r) || (*this)(l.rhs, r);
+        else if constexpr (is_or_v<UR>)   return (*this)(l, r.lhs) || (*this)(l, r.rhs);
+        else if constexpr (is_or_v<UL>)   return (*this)(l.lhs, r) && (*this)(l.rhs, r);
+        else if constexpr (is_not_v<UL> && is_not_v<UR>) return (*this)(r.m, l.m);
+        else if constexpr (requires { tag_invoke(*this, l, r); })
+            return tag_invoke(*this, l, r);
+        else return std::is_same_v<UL, UR>;
+    }
+} implies{};
+
+// ── CPO: negate ──
+constexpr inline class negate_t {
+public:
+    template<typename M>
+    constexpr auto operator()(M const& m) const {
+        using UM = std::remove_cvref_t<M>;
+        if constexpr      (std::is_same_v<UM, always_t>) return never;
+        else if constexpr (std::is_same_v<UM, never_t>)  return always;
+        else if constexpr (is_not_v<UM>) return m.m;
+        else if constexpr (requires { tag_invoke(*this, m); }) return tag_invoke(*this, m);
+        else return not_t{m};
+    }
+} negate{};
+
+// Forward declarations — operators and simplify are mutually recursive
+template<matcher L, matcher R> constexpr auto operator&(L l, R r);
+template<matcher L, matcher R> constexpr auto operator|(L l, R r);
+
+// ── CPO: simplify ──
+// NEW: handles and_t/or_t by recursively simplifying children then
+// re-applying operators, which triggers all subsumption/contradiction rules.
+constexpr inline class simplify_t {
+public:
+    template<typename M>
+    constexpr auto operator()(M const& m) const {
+        using UM = std::remove_cvref_t<M>;
+        if constexpr (std::is_same_v<UM, always_t> || std::is_same_v<UM, never_t>)
+            return m;
+        else if constexpr (is_not_v<UM>)  return negate((*this)(m.m));
+        else if constexpr (is_and_v<UM>)  return (*this)(m.lhs) & (*this)(m.rhs);
+        else if constexpr (is_or_v<UM>)   return (*this)(m.lhs) | (*this)(m.rhs);
+        else if constexpr (requires { tag_invoke(*this, m); }) return tag_invoke(*this, m);
+        else return m;
+    }
+} simplify{};
+
+// ── CPO: sum_of_products (DNF via distributive law) ──
+constexpr inline class sum_of_products_t {
+public:
+    template<typename M>
+    constexpr auto operator()(M const& m) const {
+        auto s = simplify(m);
+        using S = decltype(s);
+        if constexpr (is_not_v<S>) {
+            using Inner = std::remove_cvref_t<decltype(s.m)>;
+            if constexpr (is_and_v<Inner>)       // De Morgan: !(A&B) → !A | !B
+                return or_t{(*this)(negate(s.m.lhs)), (*this)(negate(s.m.rhs))};
+            else if constexpr (is_or_v<Inner>)   // De Morgan: !(A|B) → !A & !B
+                return (*this)(and_t{(*this)(negate(s.m.lhs)), (*this)(negate(s.m.rhs))});
+            else return s;
+        }
+        else if constexpr (is_or_v<S>)
+            return or_t{(*this)(s.lhs), (*this)(s.rhs)};
+        else if constexpr (is_and_v<S>) {
+            auto l = (*this)(s.lhs);
+            auto r = (*this)(s.rhs);
+            using LS = decltype(l); using RS = decltype(r);
+            if constexpr (is_or_v<LS>)           // (A|B)&C → (A&C)|(B&C)
+                return or_t{(*this)(and_t<typename LS::lhs_t, RS>{l.lhs, r}),
+                             (*this)(and_t<typename LS::rhs_t, RS>{l.rhs, r})};
+            else if constexpr (is_or_v<RS>)      // A&(B|C) → (A&B)|(A&C)
+                return or_t{(*this)(and_t<LS, typename RS::lhs_t>{l, r.lhs}),
+                             (*this)(and_t<LS, typename RS::rhs_t>{l, r.rhs})};
+            else return and_t<LS, RS>{l, r};
+        }
+        else return s;
+    }
+} sum_of_products{};
+
+// ── Expression operators ──
 
 template<matcher L, matcher R>
 constexpr auto operator&(L l, R r) {
     if constexpr (!is_static_v<L> || !is_static_v<R>) {
-        if constexpr (std::is_same_v<L, never_t> || std::is_same_v<R, never_t>) return never;
+        if constexpr      (std::is_same_v<L, never_t> || std::is_same_v<R, never_t>) return never;
         else if constexpr (std::is_same_v<L, always_t>) return r;
         else if constexpr (std::is_same_v<R, always_t>) return l;
         else return and_t<L,R>{l, r};
     } else {
         auto sl = simplify(l); auto sr = simplify(r);
         using TL = decltype(sl); using TR = decltype(sr);
-        if constexpr (std::is_same_v<TL,never_t>||std::is_same_v<TR,never_t>) return never;
-        else if constexpr (std::is_same_v<TL,always_t>) return sr;
-        else if constexpr (std::is_same_v<TR,always_t>) return sl;
+        if constexpr      (std::is_same_v<TL, never_t> || std::is_same_v<TR, never_t>) return never;
+        else if constexpr (std::is_same_v<TL, always_t>) return sr;
+        else if constexpr (std::is_same_v<TR, always_t>) return sl;
         else if constexpr (implies(sl, sr)) return sl;
         else if constexpr (implies(sr, sl)) return sr;
-        else if constexpr (implies(sl,negate(sr))||implies(sr,negate(sl))) return never;
+        else if constexpr (implies(sl, negate(sr)) || implies(sr, negate(sl))) return never;
         else return and_t<TL,TR>{sl, sr};
     }
 }
@@ -243,25 +236,25 @@ constexpr auto operator&(L l, R r) {
 template<matcher L, matcher R>
 constexpr auto operator|(L l, R r) {
     if constexpr (!is_static_v<L> || !is_static_v<R>) {
-        if constexpr (std::is_same_v<L,always_t>||std::is_same_v<R,always_t>) return always;
-        else if constexpr (std::is_same_v<L,never_t>) return r;
-        else if constexpr (std::is_same_v<R,never_t>) return l;
+        if constexpr      (std::is_same_v<L, always_t> || std::is_same_v<R, always_t>) return always;
+        else if constexpr (std::is_same_v<L, never_t>) return r;
+        else if constexpr (std::is_same_v<R, never_t>) return l;
         else return or_t<L,R>{l, r};
     } else {
         auto sl = simplify(l); auto sr = simplify(r);
         using TL = decltype(sl); using TR = decltype(sr);
-        if constexpr (std::is_same_v<TL,always_t>||std::is_same_v<TR,always_t>) return always;
-        else if constexpr (std::is_same_v<TL,never_t>) return sr;
-        else if constexpr (std::is_same_v<TR,never_t>) return sl;
+        if constexpr      (std::is_same_v<TL, always_t> || std::is_same_v<TR, always_t>) return always;
+        else if constexpr (std::is_same_v<TL, never_t>) return sr;
+        else if constexpr (std::is_same_v<TR, never_t>) return sl;
         else if constexpr (implies(sl, sr)) return sr;
         else if constexpr (implies(sr, sl)) return sl;
-        else if constexpr (implies(negate(sl),sr)||implies(negate(sr),sl)) return always;
+        else if constexpr (implies(negate(sl), sr) || implies(negate(sr), sl)) return always;
         else return or_t<TL,TR>{sl, sr};
     }
 }
 
 template<matcher M>
-constexpr auto operator!(M m) { return simplify(not_t{m}); }
+constexpr auto operator!(M m) { return negate(simplify(m)); }
 
 } // namespace match
 
@@ -275,25 +268,23 @@ template<op O, fs Field, auto Val>
 struct field_matcher {
     using is_matcher = void;
 
-    // Complete implication table: Eq→*, Lt→Lt/Ne, Ge→Ge/Ne, Ne→Ne
     template<op O2, fs F2, auto V2>
     friend constexpr bool tag_invoke(match::implies_t, field_matcher const&,
                                      field_matcher<O2,F2,V2> const&) {
         if constexpr (!(Field == F2)) return false;
         else if constexpr (O == op::eq) {
-            if constexpr (O2==op::eq) return Val==V2;
-            if constexpr (O2==op::ne) return Val!=V2;
-            if constexpr (O2==op::lt) return Val< V2;
-            if constexpr (O2==op::ge) return Val>=V2;
+            if constexpr      (O2==op::eq) return Val==V2;
+            else if constexpr (O2==op::ne) return Val!=V2;
+            else if constexpr (O2==op::lt) return Val< V2;
+            else                           return Val>=V2;  // ge
         }
         else if constexpr (O == op::lt) {
-            if constexpr (O2==op::lt) return Val<=V2;
-            if constexpr (O2==op::ne) return Val<=V2;
+            if constexpr (O2==op::lt || O2==op::ne) return Val<=V2;
             else return false;
         }
         else if constexpr (O == op::ge) {
-            if constexpr (O2==op::ge) return Val>=V2;
-            if constexpr (O2==op::ne) return Val> V2;
+            if constexpr      (O2==op::ge) return Val>=V2;
+            else if constexpr (O2==op::ne) return Val> V2;
             else return false;
         }
         else if constexpr (O == op::ne) {
@@ -328,7 +319,7 @@ struct field_hst {
 
 struct table {
     size_t rows = 0;
-    size_t chunk_size = 1024; // must be multiple of 64 for aligned chunk merge
+    size_t chunk_size = 1024;
 
     struct column {
         std::string_view name;
@@ -342,6 +333,7 @@ struct table {
     std::vector<uint64_t> chunk_summaries;
 
     explicit table(size_t n = 0, size_t cs = 1024) : rows(n), chunk_size(cs) {
+        assert(cs % 64 == 0);
         std::vector<uint32_t> ids(n);
         std::iota(ids.begin(), ids.end(), 0u);
         cols.push_back({"id", std::move(ids), {}, {}, {}});
@@ -372,7 +364,6 @@ struct table {
 struct engine {
     using mask_t = simd::mask_t;
 
-    // Execute with bloom-filter chunk skipping
     static mask_t execute(const table& t, match::matcher auto const& m) {
         auto sop = match::sum_of_products(m);
         uint64_t req = extract_bits(sop);
@@ -393,30 +384,28 @@ struct engine {
         return result;
     }
 
-    // Semi-join: project query results into a bitmap matcher on fk_field
     static match::field_in semi_join(const table& t, match::matcher auto const& q,
                                      std::string_view fk_field) {
         return {fk_field, std::make_shared<mask_t>(execute(t, q))};
     }
 
-    // Semi-naive join: transitive closure via iterated frontier expansion
     static match::field_in semi_naive_join(const table& t,
                                            match::matcher auto const& seed,
                                            std::string_view fk_field,
                                            std::string_view id_field = "id") {
         auto delta = execute(t, seed);
         auto total = delta;
-        while (simd::any(delta.data(), delta.size())) {
+        size_t nw = delta.size();
+        while (simd::any(delta.data(), nw)) {
             match::field_in frontier{fk_field, std::make_shared<mask_t>(delta)};
             auto reachable = execute(t, frontier);
             delta = reachable;
-            simd::bandnot(delta.data(), total.data(), delta.size());
-            simd::bor(total.data(), delta.data(), total.size());
+            simd::bandnot(delta.data(), total.data(), nw);
+            simd::bor(total.data(), delta.data(), nw);
         }
         return {id_field, std::make_shared<mask_t>(std::move(total))};
     }
 
-    // Aggregate reductions over query results
     enum class agg { sum, max, min, mean, count };
 
     static double aggregate(const table& t, match::matcher auto const& q,
@@ -430,7 +419,7 @@ struct engine {
     }
 
 private:
-    // ---- Extract required mask bits from AND chains ----
+    // ── Extract required mask bits from AND chains for bloom skip ──
     template<typename M>
     static uint64_t extract_bits(M const&) { return 0; }
 
@@ -445,7 +434,7 @@ private:
         return extract_bits(a.lhs) | extract_bits(a.rhs);
     }
 
-    // ---- Aggregate impl ----
+    // ── Aggregate reduction ──
     template<typename T>
     static double agg_impl(const mask_t& mask, const std::vector<T>& data,
                            agg op, size_t rows) {
@@ -455,15 +444,15 @@ private:
         for (size_t i = 0; i < rows; ++i) {
             if (!simd::test(mask.data(), i)) continue;
             double v = (double)data[i];
-            if      (op==agg::sum||op==agg::mean) r += v;
-            else if (op==agg::max) { if (first||v>r) r=v; }
-            else if (op==agg::min) { if (first||v<r) r=v; }
+            if      (op==agg::sum || op==agg::mean) r += v;
+            else if (op==agg::max) { if (first || v > r) r = v; }
+            else if (op==agg::min) { if (first || v < r) r = v; }
             first = false; ++n;
         }
         return (op == agg::mean && n) ? r / n : r;
     }
 
-    // ---- Eval: returns local mask for rows [start .. start+count) ----
+    // ── Eval: returns local mask for rows [start .. start+count) ──
 
     static mask_t eval(const table&, match::always_t, size_t, size_t count) {
         mask_t m(simd::num_words(count), ~0ULL);
@@ -530,8 +519,8 @@ private:
         auto& bm = *f.bitmap;
         mask_t m(simd::num_words(count), 0);
         for (size_t i = 0; i < count; ++i) {
-            uint32_t v = d[start+i];
-            if (v/64 < bm.size() && simd::test(bm.data(), v))
+            uint32_t v = d[start + i];
+            if (v / 64 < bm.size() && simd::test(bm.data(), v))
                 simd::set(m.data(), i);
         }
         return m;
@@ -544,7 +533,7 @@ private:
 
 using namespace match;
 
-// ---- Compile-Time Algebra ----
+// ── Compile-Time Algebra ──
 
 TEST(Algebra, SubsumptionAndRedundancy) {
     using lt10 = field_matcher<op::lt, "x", 10>;
@@ -565,52 +554,100 @@ TEST(Algebra, ContradictionAndTautology) {
 }
 
 TEST(Algebra, FullImplicationTable) {
+    // Lt → Ne: x<10 ⟹ x≠40  (10 ≤ 40)
     using lt10 = field_matcher<op::lt, "x", 10>;
     using ne40 = field_matcher<op::ne, "x", 40>;
+    static_assert(std::is_same_v<decltype(lt10{} & ne40{}), lt10>);
+
+    // Ge → Ne: x≥50 ⟹ x≠10  (50 > 10)
     using ge50 = field_matcher<op::ge, "x", 50>;
     using ne10 = field_matcher<op::ne, "x", 10>;
-    using ge30 = field_matcher<op::ge, "x", 30>;
+    static_assert(std::is_same_v<decltype(ge50{} & ne10{}), ge50>);
+
+    // Ne → Ne: identity only
+    using ne5a = field_matcher<op::ne, "x", 5>;
+    using ne5b = field_matcher<op::ne, "x", 5>;
+    static_assert(std::is_same_v<decltype(ne5a{} & ne5b{}), ne5a>);
+
+    // Eq subsumption
     using eq15 = field_matcher<op::eq, "x", 15>;
     using lt20 = field_matcher<op::lt, "x", 20>;
-    using ge10 = field_matcher<op::ge, "x", 10>;
-    using ge5  = field_matcher<op::ge, "x", 5>;
-
-    // Lt → Ne: x<10 ⟹ x≠40
-    static_assert(std::is_same_v<decltype(lt10{} & ne40{}), lt10>);
-    // Ge → Ne: x≥50 ⟹ x≠10
-    static_assert(std::is_same_v<decltype(ge50{} & ne10{}), ge50>);
-    // OR merging: (x≥50)|(x≥30) → x≥30
-    static_assert(std::is_same_v<decltype(ge50{} | ge30{}), ge30>);
-    // Eq subsumption
     static_assert(std::is_same_v<decltype(eq15{} & lt20{}), eq15>);
-    // Range tautology: negate(lt20)=ge20, ge20⟹ge10
+
+    // Range tautology: (x<20)|(x≥10) → always  since ¬(x<20)=x≥20, x≥20⟹x≥10
+    using ge10 = field_matcher<op::ge, "x", 10>;
     static_assert(std::is_same_v<decltype(lt20{} | ge10{}), always_t>);
-    // Not-pushdown: !(x<10) & (x≥5) → ge10 & ge5 → ge10
-    static_assert(std::is_same_v<decltype(!lt10{} & ge5{}), field_matcher<op::ge,"x",10>>);
+
     // Overlapping ranges stay as And
     static_assert(is_and_v<decltype(lt20{} & ge10{})>);
+}
+
+TEST(Algebra, OrImpliesM) {
+    using eq5  = field_matcher<op::eq, "x", 5>;
+    using eq3  = field_matcher<op::eq, "x", 3>;
+    using lt10 = field_matcher<op::lt, "x", 10>;
+
+    // Both eq5 and eq3 imply lt10 → (eq5|eq3) ⟹ lt10
+    // So (eq5|eq3) & lt10 → (eq5|eq3)
+    auto result = (eq5{} | eq3{}) & lt10{};
+    static_assert(std::is_same_v<decltype(result), or_t<eq5, eq3>>);
+}
+
+TEST(Algebra, Contrapositive) {
+    // field_hst has no leaf-swap negate → produces not_t
+    using parent = field_hst<"type", "sensor">;
+    using child  = field_hst<"type", "sensor/temp">;
+
+    auto neg_parent = !parent{};
+    auto neg_child  = !child{};
+    static_assert(is_not_v<decltype(neg_parent)>);
+
+    // child ⟹ parent, so by contrapositive: ¬parent ⟹ ¬child
+    static_assert( implies(neg_parent, neg_child));
+    static_assert(!implies(neg_child, neg_parent));
+
+    // Subsumption via contrapositive: ¬parent & ¬child → ¬parent
+    auto result = neg_parent & neg_child;
+    static_assert(std::is_same_v<decltype(result), decltype(neg_parent)>);
+}
+
+TEST(Algebra, SimplifyRecursion) {
+    using eq5  = field_matcher<op::eq, "x", 5>;
+    using lt10 = field_matcher<op::lt, "x", 10>;
+
+    // Raw and_t (not built through operator&) must still simplify
+    auto raw_and = and_t{eq5{}, lt10{}};
+    static_assert(is_and_v<decltype(raw_and)>);
+    static_assert(std::is_same_v<decltype(simplify(raw_and)), eq5>);
+
+    auto raw_or = or_t{eq5{}, lt10{}};
+    static_assert(std::is_same_v<decltype(simplify(raw_or)), lt10>);
 }
 
 TEST(Algebra, SumOfProducts) {
     using A = field_matcher<op::eq, "x", 1>;
     using B = field_matcher<op::eq, "y", 2>;
     using C = field_matcher<op::eq, "z", 3>;
+
     // (A|B) & C distributes to (A&C)|(B&C)
-    auto expr = (A{}|B{}) & C{};
-    static_assert(is_and_v<decltype(expr)>);
+    auto expr = and_t{or_t{A{}, B{}}, C{}};
     auto dnf = sum_of_products(expr);
     static_assert(is_or_v<decltype(dnf)>);
+
+    // A & (A|B) simplifies to A without distribution
+    auto absorb = and_t{A{}, or_t{A{}, B{}}};
+    static_assert(std::is_same_v<decltype(sum_of_products(absorb)), A>);
 }
 
 TEST(Algebra, HST) {
     using child  = field_hst<"type","sensor/temp">;
     using parent = field_hst<"type","sensor">;
     using other  = field_hst<"type","motor">;
-    static_assert(std::is_same_v<decltype(child{}&parent{}), child>);
-    static_assert(is_and_v<decltype(child{}&other{})>);
+    static_assert(std::is_same_v<decltype(child{} & parent{}), child>);
+    static_assert(is_and_v<decltype(child{} & other{})>);
 }
 
-// ---- Runtime Engine ----
+// ── Runtime Engine ──
 
 TEST(Engine, BasicExecution) {
     table t(5);
@@ -693,7 +730,7 @@ TEST(Engine, Aggregate) {
 }
 
 TEST(Engine, BloomFilterSkip) {
-    table t(10000, 1024);
+    table t(10240, 1024);
     t.add_column_u32("dur", 100);
     for (int i=0;i<5;++i) { t.set_tag(i,0); t.set_tag(i,1); }
     for (int i=0;i<5;++i) { t.set_tag(5*1024+i,0); t.set_tag(5*1024+i,1); }
@@ -764,7 +801,17 @@ static void BM_Aggregate(benchmark::State& st) {
 }
 BENCHMARK(BM_Aggregate)->Arg(1000000);
 
-#define RUN_BENCHMARKS 0
+static void BM_SemiNaive(benchmark::State& st) {
+    table t(10000); t.add_column_u32("pid", 999999);
+    for (uint32_t i=1;i<100;++i) t.get_col("pid").u32[i] = i-1;
+    for (auto _:st) {
+        auto r = engine::semi_naive_join(t, field_matcher<op::eq,"id",0>{}, "pid");
+        benchmark::DoNotOptimize(r);
+    }
+}
+BENCHMARK(BM_SemiNaive);
+
+#define RUN_BENCHMARKS 1
 #if RUN_BENCHMARKS
 BENCHMARK_MAIN();
 #else
