@@ -27,32 +27,38 @@ class ECSTable:
         chunk_idx = entity_id // self.chunk_size
         self.chunk_summaries[chunk_idx] |= tag_bit
 
+    def set_tags_batch(self, entity_ids: np.ndarray, tag_id: int):
+        tag_bit = np.uint64(1) << np.uint64(tag_id % 64)
+        self.cols["mask"][entity_ids] |= tag_bit
+        chunk_indices = entity_ids // self.chunk_size
+        np.bitwise_or.at(self.chunk_summaries, chunk_indices, tag_bit)
+
 class SIMDEngine:
     """Executes Matcher ASTs against ECS Tables using NumPy vectorization."""
     
     @staticmethod
     def execute(table: ECSTable, matcher: Matcher) -> np.ndarray:
-        """Returns a boolean mask of entities matching the query, optimized via Bloom Filter."""
-        # 1. Compile-Time Algebra Optimization
         optimized = sum_of_products(simplify(matcher))
-        
-        # 2. Extract Bloom Filter requirements
         required_bits = SIMDEngine._extract_bits(optimized)
         
-        # 3. Execution Path
+        # 1. No skip bits? Just one big slice.
         if required_bits == 0:
-            # Fallback: No tags to skip on, evaluate the whole table at once
             return SIMDEngine._eval(table, optimized, slice(0, table.size))
 
-        # Optimized Path: Chunk skipping
+        # 2. Vectorized identification of chunks to process
+        # We only look at chunk_summaries (tiny array)
+        active_chunk_indices = np.where((table.chunk_summaries & required_bits) == required_bits)[0]
+        
+        if len(active_chunk_indices) == 0:
+            return np.zeros(table.size, dtype=bool)
+
+        # 3. Process active chunks using Slices (Zero-Copy)
         full_mask = np.zeros(table.size, dtype=bool)
-        for i in range(table.num_chunks):
-            # Bloom Check
-            if (table.chunk_summaries[i] & required_bits) == required_bits:
-                start = i * table.chunk_size
-                end = min(start + table.chunk_size, table.size)
-                s = slice(start, end)
-                full_mask[s] = SIMDEngine._eval(table, optimized, s)
+        for i in active_chunk_indices:
+            start = i * table.chunk_size
+            end = min(start + table.chunk_size, table.size)
+            s = slice(start, end) # Slices are O(1) and zero-copy in NumPy
+            full_mask[s] = SIMDEngine._eval(table, optimized, s)
                 
         return full_mask
 
@@ -117,9 +123,17 @@ class SIMDEngine:
         total_mask = delta_mask.copy()
         
         while np.any(delta_mask):
-            # 2. Join ONLY the delta (the frontier) against the table
-            delta_bitmap = np.packbits(delta_mask, bitorder='little')
-            frontier_query = FieldIn(fk_field, delta_bitmap)
+            count = np.count_nonzero(delta_mask)
+            frontier_query = None
+
+            if count < 32:
+                # If the frontier is tiny, a set of FieldEq is faster than a Bitmap
+                frontier_ids = np.where(delta_mask)[0]
+                frontier_query = Or.from_list([FieldEq(fk_field, fid) for fid in frontier_ids])
+            else:
+                # If the frontier is large, stick to the Bitmap
+                delta_bitmap = np.packbits(delta_mask, bitorder='little')
+                frontier_query = FieldIn(fk_field, delta_bitmap)
             
             # 3. Find neighbors of the frontier
             reachable_from_delta = SIMDEngine.execute(table, frontier_query)

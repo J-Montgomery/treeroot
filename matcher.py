@@ -57,62 +57,100 @@ class FieldIn(Matcher):
     field: str
     bitmap: np.ndarray
 
+@dataclass(frozen=True)
+class And(Matcher):
+    lhs: Matcher
+    rhs: Matcher
+
+    @staticmethod
+    def from_list(matchers: list[Matcher]) -> Matcher:
+        if not matchers: return Always()
+        if len(matchers) == 1: return matchers[0]
+        mid = len(matchers) // 2
+        return And(And.from_list(matchers[:mid]), And.from_list(matchers[mid:]))
+
+@dataclass(frozen=True)
+class Or(Matcher):
+    lhs: Matcher
+    rhs: Matcher
+
+    @staticmethod
+    def from_list(matchers: list[Matcher]) -> Matcher:
+        if not matchers: return Never()
+        if len(matchers) == 1: return matchers[0]
+        mid = len(matchers) // 2
+        return Or(Or.from_list(matchers[:mid]), Or.from_list(matchers[mid:]))
+
 # --- Customization Point: Negate ---
 def negate(m: Matcher) -> Matcher:
+    # Terminals
     if isinstance(m, Always):  return Never()
     if isinstance(m, Never):   return Always()
-    if isinstance(m, Not):     return m.m # unwrap
+    
+    # Double Negation: !!A -> A
+    if isinstance(m, Not):     return m.m 
+    
+    # Leaf Swaps (Crucial for SIMD efficiency)
     if isinstance(m, FieldEq): return FieldNe(m.field, m.value)
     if isinstance(m, FieldNe): return FieldEq(m.field, m.value)
     if isinstance(m, FieldLt): return FieldGe(m.field, m.value)
     if isinstance(m, FieldGe): return FieldLt(m.field, m.value)
 
+    # For logical branches (And/Or), we just wrap them.
+    # This keeps the AST simple and avoids DNF explosion.
     return Not(m)
 
 # --- Customization Point: Implication (A => B) ---
 def implies(a: Matcher, b: Matcher) -> bool:
-    if a is b: return True # Identity is fast
+    if a is b: return True 
     
-    # 1. Structural/Terminal Logic
+    # 1. Structural Logic (Must remain recursive)
     if isinstance(a, Never) or isinstance(b, Always): return True
     if isinstance(a, And): return implies(a.lhs, b) or implies(a.rhs, b)
     if isinstance(b, Or):  return implies(a, b.lhs) or implies(a, b.rhs)
     
-    # 2. Extract Type Info Once
+    # 2. Fast Type & Field Guard
     type_a = type(a)
     type_b = type(b)
     
-    # 3. Fast-Path for Relational Matchers
-    # We use a tuple of types to check if both are relational 'leaf' nodes
-    relational_types = (FieldEq, FieldLt, FieldGe, FieldNe, FieldIn)
-    
-    if type_a in relational_types and type_b in relational_types:
-        # Direct access is faster than hasattr
-        if a.field != b.field: 
-            return False
+    # Using a tuple for 'in' is faster for small collections
+    if type_a not in (FieldEq, FieldLt, FieldGe, FieldNe, FieldIn): return False
+    if type_b not in (FieldEq, FieldLt, FieldGe, FieldNe, FieldIn): return False
+    if a.field != b.field: return False
             
-        # Comparison logic (Nested if/elif is faster than a giant flat block)
-        if type_a is FieldEq:
-            val = a.value
-            if type_b is FieldEq: return val == b.value
-            if type_b is FieldLt: return val <  b.value
-            if type_b is FieldGe: return val >= b.value
-            if type_b is FieldNe: return val != b.value
-            if type_b is FieldIn:
-                # Bitmap lookup
-                idx = val >> 3
-                return idx < len(b.bitmap) and (b.bitmap[idx] & (1 << (val & 7))) != 0
+    # 3. Flattened Dispatch Table
+    # We use local variable caching to avoid repeated attribute lookups
+    v_a = a.value if type_a is not FieldIn else None
+    v_b = b.value if type_b is not FieldIn else None
 
-        elif type_a is FieldLt:
-            if type_b is FieldLt: return a.value <= b.value
-            if type_b is FieldNe: return a.value <= b.value
+    # --- Type A: FieldEq ---
+    if type_a is FieldEq:
+        if type_b is FieldEq: return v_a == v_b
+        if type_b is FieldLt: return v_a <  v_b
+        if type_b is FieldGe: return v_a >= v_b
+        if type_b is FieldNe: return v_a != v_b
+        if type_b is FieldIn:
+            # Inline bitmap check
+            idx = v_a >> 3
+            return idx < len(b.bitmap) and (b.bitmap[idx] & (1 << (v_a & 7))) != 0
 
-        elif type_a is FieldGe:
-            if type_b is FieldGe: return a.value >= b.value
-            if type_b is FieldNe: return a.value > b.value
+    # --- Type A: FieldLt ---
+    if type_a is FieldLt:
+        if type_b is FieldLt: return v_a <= v_b
+        if type_b is FieldNe: return v_a <= v_b
 
-        elif type_a is FieldNe:
-            if type_b is FieldNe: return a.value == b.value
+    # --- Type A: FieldGe ---
+    if type_a is FieldGe:
+        if type_b is FieldGe: return v_a >= v_b
+        if type_b is FieldNe: return v_a > v_b
+
+    # --- Type A: FieldNe ---
+    if type_a is FieldNe:
+        if type_b is FieldNe: return v_a == v_b
+
+    if type_a is FieldLt and type_b is FieldGe and v_a <= v_b:
+        # (x < 10) AND (x >= 30) is impossible
+        return False # a doesn't imply b, but they're disjoint
 
     return False
 

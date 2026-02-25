@@ -26,6 +26,80 @@ def test_algebraic_simplifications():
     print(f"Contradiction    : {res3}")
     assert isinstance(res3, Never)
 
+def test_range_merging_and_pruning():
+    print("\n--- Testing Range Merging & Pruning ---")
+    
+    # Setup fields
+    x_lt_10 = FieldLt("x", 10)
+    x_lt_20 = FieldLt("x", 20)
+    x_ge_30 = FieldGe("x", 30)
+    x_ge_50 = FieldGe("x", 50)
+    x_eq_15 = FieldEq("x", 15)
+    x_ne_40 = FieldNe("x", 40)
+
+    # 1. AND Range Merging (Stricter wins)
+    # (x < 10) AND (x < 20) -> (x < 10)
+    res_and = simplify(x_lt_10 & x_lt_20)
+    print(f"AND Range Merge: {res_and}")
+    assert res_and == x_lt_10
+
+    # 2. OR Range Merging (Broader wins)
+    # (x >= 50) OR (x >= 30) -> (x >= 30)
+    res_or = simplify(x_ge_50 | x_ge_30)
+    print(f"OR Range Merge : {res_or}")
+    assert res_or == x_ge_30
+
+    # 3. Equality Subsumption
+    # (x == 15) AND (x < 20) -> (x == 15)
+    res_eq = simplify(x_eq_15 & x_lt_20)
+    print(f"EQ Subsumption : {res_eq}")
+    assert res_eq == x_eq_15
+
+    # 4. Inequality Implication
+    # (x < 10) AND (x != 40) -> (x < 10) 
+    res_ne = simplify(x_lt_10 & x_ne_40)
+    print(f"NE Subsumption : {res_ne}")
+    assert res_ne == x_lt_10
+
+    # 5. Range Contradiction
+    # (x >= 50) AND (x < 10) -> Never
+    res_contra = simplify(x_ge_50 & x_lt_10)
+    print(f"Range Conflict : {res_contra}")
+    assert isinstance(res_contra, Never)
+
+    # 6. Range Tautology (Fixed reference)
+    # (x < 20) OR (x >= 10) -> Always
+    # negate(Lt20) is Ge20. implies(Ge20, Ge10) is True.
+    x_ge_10 = FieldGe("x", 10)
+    res_taut = simplify(x_lt_20 | x_ge_10)
+    print(f"Range Tautology: {res_taut}")
+    assert isinstance(res_taut, Always)
+    
+    # 7. Not-Pushdown with Range Merging
+    # Not(x < 10) AND (x >= 5) -> (x >= 10) AND (x >= 5) -> (x >= 10)
+    x_ge_5 = FieldGe("x", 5)
+    res_complex = simplify(negate(x_lt_10) & x_ge_5)
+    print(f"Not-Push + Merge: {res_complex}")
+    assert res_complex == FieldGe("x", 10)
+
+    # 8. Explicit Disjoint Range Contradiction
+    # (x < 5) AND (x > 15) -> Never
+    x_lt_5 = FieldLt("x", 5)
+    x_ge_15 = FieldGe("x", 15) # Using Ge as our 'greater than' leaf
+    
+    res_disjoint = simplify(x_lt_5 & x_ge_15)
+    print(f"Disjoint Conflict: {res_disjoint}")
+    assert isinstance(res_disjoint, Never)
+    
+    # 9. Overlapping Ranges (Should NOT be Never)
+    # (x < 20) AND (x >= 10) -> (x < 20 & x >= 10)
+    # These overlap, so simplify should keep both as an And() node
+    x_lt_20 = FieldLt("x", 20)
+    x_ge_10 = FieldGe("x", 10)
+    res_overlap = simplify(x_lt_20 & x_ge_10)
+    print(f"Overlapping Range: {res_overlap}")
+    assert isinstance(res_overlap, And)
+
 def test_ecs_with_joins():
     print("\n--- Testing SIMD ECS & Joins ---")
     NUM_ENTITIES = 2_000_000
@@ -295,6 +369,8 @@ def test_hierarchical_tags_with_bloom():
 
 def test_recursive_chain():
     print("\n--- Testing Semi-Naive Recursion ---")
+    # This engine is deliberately unoptimized for recursive queries to go faster
+    # horizontally.
     NUM_ENTITIES = 1_000_000 
     CHAIN_LENGTH = 1000
     
@@ -394,8 +470,153 @@ def test_tautology_skip():
     mask = SIMDEngine.execute(table, always_query)
     assert np.all(mask)
 
+def test_team_aggregates():
+    print("\n--- Testing Team Aggregates (Sum/Mean) ---")
+    NUM_ENTITIES = 1_000_000
+    table = ECSTable(NUM_ENTITIES)
+    
+    # Setup columns
+    table.add_column("team", np.int32)
+    table.add_column("health", np.float32)
+    
+    # Assign half to Team 1, half to Team 2
+    table.cols["team"][:500_000] = 1
+    table.cols["team"][500_000:] = 2
+    
+    # Assign specific health values
+    # Team 1: Everyone has 100 health (Total: 50,000,000)
+    # Team 2: Everyone has 50 health  (Total: 25,000,000)
+    table.cols["health"][:500_000] = 100.0
+    table.cols["health"][500_000:] = 50.0
+
+    # Define Query: Members of Team 1
+    team_1_query = FieldEq("team", 1)
+    
+    start_time = time.time()
+    
+    # Perform Aggregations
+    total_health_t1 = SIMDEngine.aggregate(table, team_1_query, "health", "sum")
+    mean_health_t1  = SIMDEngine.aggregate(table, team_1_query, "health", "mean")
+    count_t1         = SIMDEngine.aggregate(table, team_1_query, "health", "count")
+    
+    end_time = time.time()
+
+    print(f"Team 1 Total Health: {total_health_t1}")
+    print(f"Team 1 Avg Health:   {mean_health_t1}")
+    print(f"Team 1 Count:        {count_t1}")
+    print(f"Aggregation time:    {end_time - start_time:.4f}s")
+
+    # Assertions
+    assert total_health_t1 == 50_000_000.0
+    assert mean_health_t1 == 100.0
+    assert count_t1 == 500_000
+
+def test_spatial_aabb_query():
+    print("\n--- Testing 2D Bounding Box (1M Entities) ---")
+    NUM_ENTITIES = 2_000_000
+    CHUNK_SIZE = 131_072
+    
+    # 1. Setup Table with Spatial Data
+    # We use a 1000x1000 world space
+    scene = ECSTable(NUM_ENTITIES, chunk_size=CHUNK_SIZE)
+    scene.add_column("pos_x", np.float32)
+    scene.add_column("pos_y", np.float32)
+    
+    scene.cols["pos_x"] = np.random.uniform(0, 1000, NUM_ENTITIES)
+    scene.cols["pos_y"] = np.random.uniform(0, 1000, NUM_ENTITIES)
+
+    # 2. Add a Coarse Spatial Tag (Bloom Filter Skip)
+    # Let's say Bit 10 represents "The Northern Quadrant" (y > 500)
+    NORTHERN_QUADRANT_BIT = 1 << 10
+    print("Assigning spatial tags...")
+    for i in range(NUM_ENTITIES):
+        if scene.cols["pos_y"][i] > 500:
+            scene.set_tag(i, 10)
+
+    # 3. Define the Query: A small box in the far North
+    # Box: x=[100, 150], y=[800, 850]
+    # We include the mask bit to trigger the Bloom Filter skip
+    x_min, x_max = 100.0, 150.0
+    y_min, y_max = 800.0, 850.0
+    
+    aabb_query = (
+        FieldEq("mask", NORTHERN_QUADRANT_BIT) & 
+        FieldGe("pos_x", x_min) & FieldLt("pos_x", x_max) &
+        FieldGe("pos_y", y_min) & FieldLt("pos_y", y_max)
+    )
+
+    # 4. Benchmark the SIMD Execution
+    start_time = time.time()
+    results_mask = SIMDEngine.execute(scene, aabb_query)
+    exec_time = time.time() - start_time
+    
+    num_found = np.sum(results_mask)
+    print(f"Found {num_found} entities in the bounding box.")
+    print(f"SIMD + Bloom Execution Time: {exec_time:.6f}s")
+
+    # 5. Benchmark a Raw NumPy Scan
+    # Not representative of a real-world scenario since no one queries bounding boxes this way
+    start_raw = time.time()
+    raw_mask = (scene.cols["pos_x"] >= x_min) & (scene.cols["pos_x"] < x_max) & \
+               (scene.cols["pos_y"] >= y_min) & (scene.cols["pos_y"] < y_max)
+    raw_time = time.time() - start_raw
+    
+    print(f"Raw Vectorized Scan Time:    {raw_time:.6f}s")
+    print(f"Speedup Factor: {raw_time / exec_time:.2f}x")
+
+def test_single_player_quest_log():
+    print("\n--- Testing Single-Player Quest Logic ---")
+    
+    # Static Quest Definitions (The "Database")
+    quests = ECSTable(100) # 100 possible quests in the game
+    quests.add_column("quest_id", np.int32)
+    quests.add_column("min_level", np.int32)
+    quests.cols["quest_id"] = np.arange(100)
+    quests.cols["min_level"] = np.random.randint(1, 20, 100)
+    
+    # Player State
+    player_level = 15
+    
+    # Quest Progress (The "Journal")
+    # In a single player game, this table is small (e.g., 20 active quests)
+    journal = ECSTable(50) 
+    journal.add_column("quest_id", np.int32)
+    journal.add_column("status", np.int8) # 0: Available, 1: Active, 2: Done
+    
+    # Mocking a journal: 5 done, 5 active
+    journal.cols["quest_id"][:10] = np.arange(10)
+    journal.cols["status"][:5] = 2 # Completed
+    journal.cols["status"][5:10] = 1 # Active
+    
+    start_time = time.time()
+    # --- QUERY 1: Get Completed Quest IDs ---
+    completed_query = FieldEq("status", 2)
+    completed_mask = SIMDEngine.execute(journal, completed_query)
+    done_ids = journal.cols["quest_id"][completed_mask]
+    
+    # --- QUERY 2: Find "Unlockable" Quests ---
+    already_known_matcher = SIMDEngine.semi_join(
+        target_table=journal,
+        target_query=Always(),
+        local_fk_field="quest_id"
+    )
+    
+    # Simplify: Level check AND NOT(in journal)
+    unlock_query = FieldLt("min_level", player_level + 1) & negate(already_known_matcher)
+    
+    available_mask = SIMDEngine.execute(quests, unlock_query)
+    available_ids = quests.cols["quest_id"][available_mask]
+
+    end_time = time.time()
+    
+    print(f"Quests Done: {done_ids.tolist()}")
+    print(f"New Quests Available: {len(available_ids)}")
+    print(f"Quest Lookup time:    {end_time - start_time:.4f}s")
+
 if __name__ == "__main__":
     test_algebraic_simplifications()
+    test_range_merging_and_pruning()
+
     test_ecs_with_joins()
     test_sparse_performance()
     test_logic_bomb()
@@ -408,3 +629,7 @@ if __name__ == "__main__":
     test_contradiction_execution()
     test_empty_join()
     test_tautology_skip()
+
+    test_team_aggregates()
+    test_spatial_aabb_query()
+    test_single_player_quest_log()
