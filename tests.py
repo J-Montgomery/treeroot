@@ -1,7 +1,7 @@
 import time
 import numpy as np
 from matcher import *
-from ecs import ECSTable, SIMDEngine, ChunkedECSTable, OptimizedSIMDEngine
+from ecs import ECSTable, SIMDEngine
 
 def test_algebraic_simplifications():
     print("--- Testing Boolean Algebra Compiler ---")
@@ -230,7 +230,7 @@ def test_negative_join():
     # 3. Combine and Simplify
     final_query = simplify(FieldGe("rarity", 91) & item_join_matcher)
     
-    results = OptimizedSIMDEngine.execute(items, final_query)
+    results = SIMDEngine.execute(items, final_query)
     end_time = time.time()
     
     print(f"Found {np.sum(results)} items for non-Team 2 players.")
@@ -243,7 +243,7 @@ def test_hierarchical_tags_with_bloom():
     
     # 1. Setup Table
     # mask will store our hierarchical bits
-    items = ChunkedECSTable(NUM_ENTITIES, chunk_size=CHUNK_SIZE)
+    items = ECSTable(NUM_ENTITIES, chunk_size=CHUNK_SIZE)
     items.add_column("durability", np.int32, default_val=100)
     
     # 2. Define Tag IDs (Simulating Hierarchy)
@@ -275,7 +275,7 @@ def test_hierarchical_tags_with_bloom():
     
     # 5. Execute with Timing
     start_time = time.time()
-    results_mask = OptimizedSIMDEngine.execute(items, query)
+    results_mask = SIMDEngine.execute(items, query)
     end_time = time.time()
     
     num_found = np.sum(results_mask)
@@ -285,14 +285,39 @@ def test_hierarchical_tags_with_bloom():
     print(f"Found {num_found} Legendary Swords.")
     print(f"Bloom Filter Execution Time: {end_time - start_time:.6f}s")
     
-    # 6. Compare to Raw Scan (for PoC validation)
-    # This simulates what happens if the Bloom Filter fails/is disabled
+    # 6. Compare to manual scan
     start_raw = time.time()
     raw_mask = (items.cols["mask"] & TAG_SWORD == TAG_SWORD) & (items.cols["durability"] < 150)
     end_raw = time.time()
     
     print(f"Raw Vectorized Scan Time:   {end_raw - start_raw:.6f}s")
     print(f"Speedup Factor: { (end_raw - start_raw) / (end_time - start_time):.2f}x")
+
+def test_recursive_chain():
+    print("\n--- Testing Semi-Naive Recursion ---")
+    NUM_ENTITIES = 1_000_000 
+    CHAIN_LENGTH = 1000
+    
+    table = ECSTable(NUM_ENTITIES)
+    # Use a 'null' ID for default_val so we don't point to Entity 0
+    table.add_column("parent_id", np.uint32, default_val=999_999_999)
+    
+    # 0 -> 1 -> 2 ...
+    ids = np.arange(CHAIN_LENGTH)
+    table.cols["parent_id"][1:CHAIN_LENGTH] = ids[:-1]
+    
+    initial_seed = FieldEq("id", 0)
+    
+    start_time = time.time()
+    final_matcher = SIMDEngine.semi_naive_join(table, initial_seed, "parent_id")
+    results = SIMDEngine.execute(table, final_matcher)
+    end_time = time.time()
+    
+    num_found = np.sum(results)
+    print(f"Found {num_found} connected entities.")
+    print(f"Total time for {CHAIN_LENGTH} steps: {end_time - start_time:.4f}s")
+    
+    assert num_found == CHAIN_LENGTH
 
 if __name__ == "__main__":
     test_algebraic_simplifications()
@@ -302,3 +327,4 @@ if __name__ == "__main__":
     test_triple_join()
     test_negative_join()
     test_hierarchical_tags_with_bloom()
+    test_recursive_chain()
