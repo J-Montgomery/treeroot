@@ -10,6 +10,12 @@
 #include <string_view>
 #include <type_traits>
 #include <vector>
+
+#include <functional>
+#include <unordered_map>
+#include <unordered_set>
+#include <numeric>
+
 #include <gtest/gtest.h>
 #include <benchmark/benchmark.h>
 
@@ -563,6 +569,501 @@ private:
         }
     }
 };
+namespace datalog {
+
+using mask_t = engine::mask_t;
+
+namespace bits {
+    inline size_t words(size_t n) { return (n + 63) / 64; }
+    inline bool test(const mask_t& m, size_t i) {
+        return i / 64 < m.size() && (m[i / 64] & (1ULL << (i % 64)));
+    }
+    inline void set(mask_t& m, size_t i) {
+        if (i / 64 < m.size()) m[i / 64] |= (1ULL << (i % 64));
+    }
+    inline void clear_tail(mask_t& m, size_t n) {
+        if (n % 64 && !m.empty()) m.back() &= (1ULL << (n % 64)) - 1;
+    }
+    inline bool any(const mask_t& m) {
+        for (auto w : m) if (w) return true;
+        return false;
+    }
+}
+
+struct atom { std::string rel; std::vector<std::string> vars; bool negated = false; };
+
+struct rule_def {
+    std::string head;
+    std::vector<std::string> head_vars;
+    std::vector<atom> body;
+    std::function<mask_t(const table&)> filter;
+    size_t filter_body = 0;
+};
+
+class program {
+    // ── storage ──────────────────────────────────────────────────────────────
+    struct edb_entry { std::string name; const table* tbl; std::vector<std::string> cols; };
+
+    struct tuple_hash {
+        size_t operator()(const std::vector<uint32_t>& v) const {
+            size_t h = v.size();
+            for (auto x : v) h ^= std::hash<uint32_t>{}(x) + 0x9e3779b9 + (h<<6) + (h>>2);
+            return h;
+        }
+    };
+
+    struct idb_entry {
+        std::string name;
+        bool unary;
+        size_t universe;
+        mask_t mask;
+        std::vector<std::string> col_names;
+        std::vector<std::vector<uint32_t>> data;
+        size_t nrows;
+        std::unordered_set<std::vector<uint32_t>, tuple_hash> seen;
+
+        bool insert(const std::vector<uint32_t>& t) {
+            if (!seen.insert(t).second) return false;
+            for (size_t c = 0; c < t.size(); ++c) data[c].push_back(t[c]);
+            ++nrows;
+            return true;
+        }
+    };
+
+    std::vector<edb_entry> edbs_;
+    std::vector<idb_entry> idbs_;
+    std::vector<rule_def> rules_;
+
+    const edb_entry* edb(const std::string& n) const {
+        for (auto& e : edbs_) if (e.name == n) return &e;
+        return nullptr;
+    }
+    idb_entry* idb(const std::string& n) {
+        for (auto& e : idbs_) if (e.name == n) return &e;
+        return nullptr;
+    }
+    const idb_entry* idb(const std::string& n) const {
+        for (auto& e : idbs_) if (e.name == n) return &e;
+        return nullptr;
+    }
+
+    // ── variable environment ─────────────────────────────────────────────────
+    using env_t = std::vector<std::pair<std::string, uint32_t>>;
+
+    static const uint32_t* lookup(const env_t& e, const std::string& v) {
+        for (auto& [k, val] : e) if (k == v) return &val;
+        return nullptr;
+    }
+
+    // find column in ea that shares a variable name with ba
+    static int shared_edb_col(const atom& ea, const atom& ba) {
+        for (size_t i = 0; i < ba.vars.size(); ++i)
+            for (size_t j = 0; j < ea.vars.size(); ++j)
+                if (ba.vars[i] == ea.vars[j]) return (int)j;
+        return -1;
+    }
+
+    // ── bitmask fast path ────────────────────────────────────────────────────
+    // eligible: unary head, exactly 1 EDB body, all other body atoms unary IDB
+    bool can_fast(const rule_def& r) const {
+        auto* h = idb(r.head);
+        if (!h || !h->unary) return false;
+        int ec = 0;
+        for (auto& a : r.body) {
+            if (edb(a.rel)) ++ec;
+            else { auto* p = idb(a.rel); if (!p || !p->unary) return false; }
+        }
+        return ec == 1;
+    }
+
+    void fire_fast(const rule_def& rule, const std::string* dr,
+                   const mask_t* db, mask_t& out) {
+        size_t ei = SIZE_MAX;
+        for (size_t i = 0; i < rule.body.size(); ++i)
+            if (edb(rule.body[i].rel)) { ei = i; break; }
+        if (ei == SIZE_MAX) return;
+
+        auto& ea = rule.body[ei];
+        auto* ed = edb(ea.rel);
+        const table& t = *ed->tbl;
+        size_t n = t.rows, w = bits::words(n);
+
+        mask_t rm(w, ~0ULL);
+        bits::clear_tail(rm, n);
+
+        if (rule.filter && rule.filter_body == ei) {
+            auto f = rule.filter(t);
+            for (size_t i = 0; i < w; ++i) rm[i] &= f[i];
+        }
+
+        for (size_t i = 0; i < rule.body.size(); ++i) {
+            if (i == ei) continue;
+            auto& ba = rule.body[i];
+            auto* p = idb(ba.rel);
+            if (!p || !p->unary) continue;
+
+            const mask_t& b = (dr && ba.rel == *dr && db) ? *db : p->mask;
+            int ec = shared_edb_col(ea, ba);
+            if (ec < 0) continue;
+
+            auto& col = t.get_col(ed->cols[ec]).u32;
+            mask_t sj(w, 0);
+            for (size_t r = 0; r < n; ++r)
+                if (bits::test(b, col[r])) sj[r / 64] |= 1ULL << (r % 64);
+
+            if (ba.negated) {
+                for (size_t j = 0; j < w; ++j) sj[j] = ~sj[j];
+                bits::clear_tail(sj, n);
+            }
+            for (size_t j = 0; j < w; ++j) rm[j] &= sj[j];
+        }
+
+        int pc = -1;
+        for (size_t j = 0; j < ea.vars.size(); ++j)
+            if (ea.vars[j] == rule.head_vars[0]) { pc = (int)j; break; }
+        if (pc < 0) return;
+
+        auto& pcol = t.get_col(ed->cols[pc]).u32;
+        for (size_t r = 0; r < n; ++r)
+            if (rm[r / 64] & (1ULL << (r % 64)))
+                bits::set(out, pcol[r]);
+    }
+
+    // ── general nested-loop join ─────────────────────────────────────────────
+    struct output {
+        mask_t* ubits = nullptr;
+        std::vector<std::vector<uint32_t>>* cols = nullptr;
+        size_t* nrows = nullptr;
+        std::unordered_set<std::vector<uint32_t>, tuple_hash>* seen = nullptr;
+        const std::vector<std::string>* hvars = nullptr;
+    };
+
+    void emit(const env_t& env, const output& o) {
+        if (o.ubits) {
+            auto* p = lookup(env, (*o.hvars)[0]);
+            if (p) bits::set(*o.ubits, *p);
+        } else if (o.cols) {
+            std::vector<uint32_t> t(o.hvars->size());
+            for (size_t i = 0; i < t.size(); ++i) {
+                auto* p = lookup(env, (*o.hvars)[i]);
+                t[i] = p ? *p : 0;
+            }
+            if (o.seen->insert(t).second) {
+                for (size_t c = 0; c < t.size(); ++c) (*o.cols)[c].push_back(t[c]);
+                ++(*o.nrows);
+            }
+        }
+    }
+
+    void njoin(const rule_def& rule, const std::vector<size_t>& order, size_t pos,
+               env_t& env, const std::string* dr, const mask_t* db,
+               const std::vector<std::vector<uint32_t>>* dc, size_t dnr,
+               const output& out) {
+        if (pos == order.size()) { emit(env, out); return; }
+
+        size_t ai = order[pos];
+        auto& a = rule.body[ai];
+        bool use_d = dr && a.rel == *dr && !a.negated;
+
+        auto try_row = [&](auto get_val, size_t nc) {
+            size_t orig = env.size();
+            bool ok = true;
+            for (size_t c = 0; c < nc && ok; ++c) {
+                uint32_t v = get_val(c);
+                auto* p = lookup(env, a.vars[c]);
+                if (p) { if (*p != v) ok = false; }
+                else env.emplace_back(a.vars[c], v);
+            }
+            if (ok) njoin(rule, order, pos + 1, env, dr, db, dc, dnr, out);
+            env.resize(orig);
+        };
+
+        if (auto* ed = edb(a.rel)) {
+            const table& t = *ed->tbl;
+            size_t n = t.rows;
+            int bc = -1; uint32_t bv = 0;
+            for (size_t c = 0; c < a.vars.size(); ++c) {
+                auto* p = lookup(env, a.vars[c]);
+                if (p) { bc = (int)c; bv = *p; break; }
+            }
+            mask_t fm;
+            if (rule.filter && rule.filter_body == ai) fm = rule.filter(t);
+
+            for (size_t r = 0; r < n; ++r) {
+                if (!fm.empty() && !(fm[r / 64] & (1ULL << (r % 64)))) continue;
+                if (bc >= 0 && t.get_col(ed->cols[bc]).u32[r] != bv) continue;
+                try_row([&](size_t c) { return t.get_col(ed->cols[c]).u32[r]; },
+                        a.vars.size());
+            }
+        } else if (auto* p = idb(a.rel)) {
+            if (p->unary) {
+                const mask_t& b = (use_d && db) ? *db : p->mask;
+                auto* bound = lookup(env, a.vars[0]);
+                if (a.negated) {
+                    if (bound && !bits::test(b, *bound))
+                        njoin(rule, order, pos + 1, env, dr, db, dc, dnr, out);
+                } else if (bound) {
+                    if (bits::test(b, *bound))
+                        njoin(rule, order, pos + 1, env, dr, db, dc, dnr, out);
+                } else {
+                    for (size_t v = 0; v < p->universe; ++v) {
+                        if (!bits::test(b, v)) continue;
+                        size_t orig = env.size();
+                        env.emplace_back(a.vars[0], (uint32_t)v);
+                        njoin(rule, order, pos + 1, env, dr, db, dc, dnr, out);
+                        env.resize(orig);
+                    }
+                }
+            } else {
+                auto& cs = (use_d && dc) ? *dc : p->data;
+                size_t nr = (use_d && dc) ? dnr : p->nrows;
+                int bc = -1; uint32_t bv = 0;
+                for (size_t c = 0; c < a.vars.size(); ++c) {
+                    auto* q = lookup(env, a.vars[c]);
+                    if (q) { bc = (int)c; bv = *q; break; }
+                }
+                for (size_t r = 0; r < nr; ++r) {
+                    if (bc >= 0 && cs[bc][r] != bv) continue;
+                    try_row([&](size_t c) { return cs[c][r]; }, a.vars.size());
+                }
+            }
+        }
+    }
+
+    void fire_general(const rule_def& rule, const std::string* dr,
+                      const mask_t* db,
+                      const std::vector<std::vector<uint32_t>>* dc, size_t dnr,
+                      const output& out) {
+        std::vector<size_t> order;
+        if (dr)
+            for (size_t i = 0; i < rule.body.size(); ++i)
+                if (rule.body[i].rel == *dr && !rule.body[i].negated)
+                    { order.push_back(i); break; }
+        for (size_t i = 0; i < rule.body.size(); ++i)
+            if (std::find(order.begin(), order.end(), i) == order.end()
+                && edb(rule.body[i].rel))
+                order.push_back(i);
+        for (size_t i = 0; i < rule.body.size(); ++i)
+            if (std::find(order.begin(), order.end(), i) == order.end())
+                order.push_back(i);
+        env_t env;
+        njoin(rule, order, 0, env, dr, db, dc, dnr, out);
+    }
+
+    // ── stratification ───────────────────────────────────────────────────────
+    struct stratum_t { std::vector<size_t> rule_ids; };
+
+    std::vector<stratum_t> stratify() {
+        std::unordered_map<std::string, int> sn;
+        for (auto& e : edbs_) sn[e.name] = -1;
+        for (auto& e : idbs_) sn[e.name] = 0;
+        for (bool chg = true; chg;) {
+            chg = false;
+            for (auto& r : rules_) {
+                int req = 0;
+                for (auto& a : r.body) {
+                    auto it = sn.find(a.rel);
+                    if (it == sn.end() || it->second < 0) continue;
+                    req = std::max(req, a.negated ? it->second + 1 : it->second);
+                }
+                if (req > sn[r.head]) { sn[r.head] = req; chg = true; }
+            }
+        }
+        int mx = 0;
+        for (auto& [_, s] : sn) mx = std::max(mx, s);
+        std::vector<stratum_t> res(mx + 1);
+        for (size_t i = 0; i < rules_.size(); ++i) {
+            int s = sn[rules_[i].head];
+            if (s >= 0) res[s].rule_ids.push_back(i);
+        }
+        return res;
+    }
+
+    bool is_recursive(const rule_def& r) const {
+        for (auto& a : r.body) if (!a.negated && idb(a.rel)) return true;
+        return false;
+    }
+
+    output make_output(const rule_def& r, idb_entry& h) {
+        output o; o.hvars = &r.head_vars;
+        if (h.unary) o.ubits = &h.mask;
+        else { o.cols = &h.data; o.nrows = &h.nrows; o.seen = &h.seen; }
+        return o;
+    }
+
+    // ── stratum evaluation ───────────────────────────────────────────────────
+    void eval_stratum(stratum_t& s) {
+        std::vector<size_t> base, rec;
+        for (size_t ri : s.rule_ids)
+            (is_recursive(rules_[ri]) ? rec : base).push_back(ri);
+
+        for (size_t ri : base) {
+            auto& r = rules_[ri]; auto* h = idb(r.head);
+            if (can_fast(r)) fire_fast(r, nullptr, nullptr, h->mask);
+            else fire_general(r, nullptr, nullptr, nullptr, 0, make_output(r, *h));
+        }
+        if (rec.empty()) return;
+
+        std::unordered_set<std::string> inv;
+        for (size_t ri : rec) {
+            inv.insert(rules_[ri].head);
+            for (auto& a : rules_[ri].body)
+                if (!a.negated && idb(a.rel)) inv.insert(a.rel);
+        }
+
+        struct delta_t { mask_t bits; std::vector<std::vector<uint32_t>> cols; size_t nrows = 0; };
+        std::unordered_map<std::string, delta_t> deltas;
+        for (auto& nm : inv) {
+            auto* p = idb(nm); delta_t d;
+            if (p->unary) d.bits = p->mask;
+            else { d.cols = p->data; d.nrows = p->nrows; }
+            deltas[nm] = std::move(d);
+        }
+
+        for (bool any_new = true; any_new;) {
+            any_new = false;
+
+            std::unordered_map<std::string, delta_t> accum;
+            std::unordered_map<std::string,
+                std::unordered_set<std::vector<uint32_t>, tuple_hash>> acc_seen;
+            for (auto& nm : inv) {
+                auto* p = idb(nm); delta_t a;
+                if (p->unary) a.bits.resize(p->mask.size(), 0);
+                else a.cols.resize(p->col_names.size());
+                accum[nm] = std::move(a);
+                if (!p->unary) acc_seen[nm];
+            }
+
+            for (size_t ri : rec) {
+                auto& rule = rules_[ri];
+                for (auto& ba : rule.body) {
+                    if (ba.negated || !idb(ba.rel)) continue;
+                    std::string dn = ba.rel;
+                    auto& d = deltas[dn];
+                    auto* hi = idb(rule.head);
+                    auto* di = idb(dn);
+
+                    if (can_fast(rule) && hi->unary && di->unary) {
+                        fire_fast(rule, &dn, &d.bits, accum[rule.head].bits);
+                    } else {
+                        auto& ac = accum[rule.head];
+                        output o; o.hvars = &rule.head_vars;
+                        if (hi->unary) {
+                            o.ubits = &ac.bits;
+                        } else {
+                            o.cols = &ac.cols; o.nrows = &ac.nrows;
+                            o.seen = &acc_seen[rule.head];
+                        }
+                        fire_general(rule, &dn,
+                                     di->unary ? &d.bits : nullptr,
+                                     di->unary ? nullptr : &d.cols, d.nrows, o);
+                    }
+                    break;
+                }
+            }
+
+            for (auto& nm : inv) {
+                auto* p = idb(nm); auto& ac = accum[nm];
+                if (p->unary) {
+                    for (size_t w = 0; w < ac.bits.size(); ++w) ac.bits[w] &= ~p->mask[w];
+                    if (bits::any(ac.bits)) {
+                        any_new = true;
+                        for (size_t w = 0; w < ac.bits.size(); ++w) p->mask[w] |= ac.bits[w];
+                    }
+                    deltas[nm].bits = std::move(ac.bits);
+                } else {
+                    delta_t nd; nd.cols.resize(p->col_names.size());
+                    for (size_t r = 0; r < ac.nrows; ++r) {
+                        std::vector<uint32_t> t(p->col_names.size());
+                        for (size_t c = 0; c < t.size(); ++c) t[c] = ac.cols[c][r];
+                        if (p->insert(t)) {
+                            for (size_t c = 0; c < t.size(); ++c) nd.cols[c].push_back(t[c]);
+                            ++nd.nrows; any_new = true;
+                        }
+                    }
+                    deltas[nm] = std::move(nd);
+                }
+            }
+        }
+    }
+
+public:
+    void add_edb(std::string name, const table& t, std::vector<std::string> cols) {
+        edbs_.push_back({std::move(name), &t, std::move(cols)});
+    }
+    void add_idb(std::string name, size_t universe) {
+        idb_entry e;
+        e.name = std::move(name); e.unary = true; e.universe = universe;
+        e.mask.resize(bits::words(universe), 0); e.nrows = 0;
+        idbs_.push_back(std::move(e));
+    }
+    void add_idb_table(std::string name, std::vector<std::string> cols) {
+        idb_entry e;
+        e.name = std::move(name); e.unary = false; e.universe = 0;
+        e.col_names = std::move(cols); e.data.resize(e.col_names.size()); e.nrows = 0;
+        idbs_.push_back(std::move(e));
+    }
+    void add_rule(rule_def r) { rules_.push_back(std::move(r)); }
+    void evaluate() { auto ss = stratify(); for (auto& s : ss) eval_stratum(s); }
+
+    const mask_t& get_bits(const std::string& n) const { return idb(n)->mask; }
+    struct store_view {
+        size_t nrows, arity;
+        const std::vector<std::vector<uint32_t>>& cols;
+    };
+    store_view get_store(const std::string& n) const {
+        auto* p = idb(n);
+        return {p->nrows, p->col_names.size(), p->data};
+    }
+};
+
+} // namespace datalog
+
+namespace {
+
+table make_nodes(size_t n) {
+    return table(n); // constructor creates "id" = {0..n-1} and "mask"
+}
+
+table make_edges(std::vector<std::pair<uint32_t, uint32_t>> es) {
+    size_t n = es.size();
+    table t(n);
+    t.add_column_u32("src");
+    t.add_column_u32("dst");
+    auto& src = t.get_col("src").u32;
+    auto& dst = t.get_col("dst").u32;
+    for (size_t i = 0; i < n; ++i) { src[i] = es[i].first; dst[i] = es[i].second; }
+    return t;
+}
+
+table make_table(size_t n,
+                 std::initializer_list<std::pair<const char*, std::vector<uint32_t>>> extra) {
+    table t(n);
+    for (auto& [name, vals] : extra) {
+        t.add_column_u32(name);
+        t.get_col(name).u32 = vals;
+    }
+    return t;
+}
+
+bool bt(const engine::mask_t& m, size_t i) {
+    return i / 64 < m.size() && (m[i / 64] & (1ULL << (i % 64)));
+}
+size_t popcnt(const engine::mask_t& m, size_t n) {
+    size_t c = 0; for (size_t i = 0; i < n; ++i) c += bt(m, i); return c;
+}
+bool has_fact(const datalog::program::store_view& s, std::initializer_list<uint32_t> v) {
+    std::vector<uint32_t> t(v);
+    for (size_t r = 0; r < s.nrows; ++r) {
+        bool ok = true;
+        for (size_t c = 0; c < s.arity && ok; ++c)
+            if (s.cols[c][r] != t[c]) ok = false;
+        if (ok) return true;
+    }
+    return false;
+}
+
+} // namespace
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Tests
@@ -809,6 +1310,326 @@ TEST(Engine, NegativeJoin) {
     for (size_t i=5;i<10;++i) EXPECT_FALSE(simd::test(r.data(),i));
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Datalog Unit Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Unary base cases ─────────────────────────────────────────────────────────
+
+TEST(Datalog, UnaryBaseNoFilter) {
+    auto edges = make_edges({{0,1},{1,2},{2,3}});
+    datalog::program p;
+    p.add_edb("edge", edges, {"src","dst"});
+    p.add_idb("r", 4);
+    p.add_rule({"r", {"X"}, {{"edge", {"X","D"}}}});
+    p.evaluate();
+    EXPECT_TRUE(bt(p.get_bits("r"), 0));
+    EXPECT_TRUE(bt(p.get_bits("r"), 1));
+    EXPECT_TRUE(bt(p.get_bits("r"), 2));
+    EXPECT_FALSE(bt(p.get_bits("r"), 3));
+}
+
+TEST(Datalog, UnaryBaseWithFilter) {
+    auto nodes = make_nodes(5);
+    datalog::program p;
+    p.add_edb("nodes", nodes, {"id"});
+    p.add_idb("seed", 5);
+    p.add_rule({"seed", {"X"}, {{"nodes", {"X"}}},
+        [](const table& t) -> engine::mask_t {
+            return engine::execute(t, field_matcher<op::lt, "id", 3>{});
+        }, 0});
+    p.evaluate();
+    EXPECT_EQ(popcnt(p.get_bits("seed"), 5), 3u);
+    EXPECT_TRUE(bt(p.get_bits("seed"), 0));
+    EXPECT_TRUE(bt(p.get_bits("seed"), 2));
+    EXPECT_FALSE(bt(p.get_bits("seed"), 3));
+}
+
+TEST(Datalog, UnaryBaseEmpty) {
+    auto nodes = make_nodes(0);
+    datalog::program p;
+    p.add_edb("n", nodes, {"id"});
+    p.add_idb("s", 10);
+    p.add_rule({"s", {"X"}, {{"n", {"X"}}}});
+    p.evaluate();
+    EXPECT_EQ(popcnt(p.get_bits("s"), 10), 0u);
+}
+
+TEST(Datalog, UnaryBaseNoMatches) {
+    auto nodes = make_nodes(3);
+    datalog::program p;
+    p.add_edb("n", nodes, {"id"});
+    p.add_idb("s", 3);
+    p.add_rule({"s", {"X"}, {{"n", {"X"}}},
+        [](const table& t) -> engine::mask_t {
+            return engine::execute(t, field_matcher<op::ge, "id", 100>{});
+        }, 0});
+    p.evaluate();
+    EXPECT_EQ(popcnt(p.get_bits("s"), 3), 0u);
+}
+
+TEST(Datalog, MultipleRulesSameHead) {
+    auto nodes = make_nodes(5);
+    auto edges = make_edges({{3,4},{4,0}});
+    datalog::program p;
+    p.add_edb("nodes", nodes, {"id"});
+    p.add_edb("edge", edges, {"src","dst"});
+    p.add_idb("r", 5);
+    p.add_rule({"r", {"X"}, {{"nodes", {"X"}}},
+        [](const table& t) -> engine::mask_t {
+            return engine::execute(t, field_matcher<op::lt, "id", 2>{});
+        }, 0});
+    p.add_rule({"r", {"X"}, {{"edge", {"X","D"}}}});
+    p.evaluate();
+    EXPECT_TRUE(bt(p.get_bits("r"), 0));
+    EXPECT_TRUE(bt(p.get_bits("r"), 1));
+    EXPECT_FALSE(bt(p.get_bits("r"), 2));
+    EXPECT_TRUE(bt(p.get_bits("r"), 3));
+    EXPECT_TRUE(bt(p.get_bits("r"), 4));
+}
+
+TEST(Datalog, TCLinearChain) {
+    auto edges = make_edges({{0,1},{1,2},{2,3},{3,4}});
+    datalog::program p;
+    p.add_edb("edge", edges, {"src","dst"});
+    p.add_idb("reach", 5);
+    p.add_rule({"reach", {"X"}, {{"edge", {"X","D"}}}});
+    p.add_rule({"reach", {"X"}, {{"reach", {"Y"}}, {"edge", {"Y","X"}}}});
+    p.evaluate();
+    for (int i = 0; i <= 4; ++i)
+        EXPECT_TRUE(bt(p.get_bits("reach"), i)) << "missing " << i;
+}
+
+TEST(Datalog, TCCycle) {
+    auto edges = make_edges({{0,1},{1,2},{2,0}});
+    datalog::program p;
+    p.add_edb("edge", edges, {"src","dst"});
+    p.add_idb("reach", 3);
+    p.add_rule({"reach", {"X"}, {{"edge", {"X","D"}}}});
+    p.add_rule({"reach", {"X"}, {{"reach", {"Y"}}, {"edge", {"Y","X"}}}});
+    p.evaluate();
+    EXPECT_EQ(popcnt(p.get_bits("reach"), 3), 3u);
+}
+
+TEST(Datalog, TCDiamond) {
+    auto edges = make_edges({{0,1},{0,2},{1,3},{2,3}});
+    datalog::program p;
+    p.add_edb("edge", edges, {"src","dst"});
+    p.add_idb("reach", 4);
+    p.add_rule({"reach", {"X"}, {{"edge", {"X","D"}}}});
+    p.add_rule({"reach", {"X"}, {{"reach", {"Y"}}, {"edge", {"Y","X"}}}});
+    p.evaluate();
+    EXPECT_EQ(popcnt(p.get_bits("reach"), 4), 4u);
+}
+
+TEST(Datalog, TCDisconnected) {
+    auto edges = make_edges({{0,1},{1,2},{5,6},{6,7}});
+    datalog::program p;
+    p.add_edb("edge", edges, {"src","dst"});
+    p.add_idb("reach", 8);
+    p.add_rule({"reach", {"X"}, {{"edge", {"X","D"}}}});
+    p.add_rule({"reach", {"X"}, {{"reach", {"Y"}}, {"edge", {"Y","X"}}}});
+    p.evaluate();
+    for (int i : {0,1,2,5,6,7}) EXPECT_TRUE(bt(p.get_bits("reach"), i)) << i;
+    for (int i : {3,4})         EXPECT_FALSE(bt(p.get_bits("reach"), i)) << i;
+}
+
+TEST(Datalog, TCDeep) {
+    std::vector<std::pair<uint32_t,uint32_t>> es;
+    for (uint32_t i = 0; i < 100; ++i) es.push_back({i, i + 1});
+    auto edges = make_edges(std::move(es));
+    datalog::program p;
+    p.add_edb("edge", edges, {"src","dst"});
+    p.add_idb("reach", 101);
+    p.add_rule({"reach", {"X"}, {{"edge", {"X","D"}}}});
+    p.add_rule({"reach", {"X"}, {{"reach", {"Y"}}, {"edge", {"Y","X"}}}});
+    p.evaluate();
+    EXPECT_EQ(popcnt(p.get_bits("reach"), 101), 101u);
+}
+
+TEST(Datalog, FixpointSaturates) {
+    auto edges = make_edges({{0,1},{1,0}});
+    datalog::program p;
+    p.add_edb("edge", edges, {"src","dst"});
+    p.add_idb("reach", 2);
+    p.add_rule({"reach", {"X"}, {{"edge", {"X","D"}}}});
+    p.add_rule({"reach", {"X"}, {{"reach", {"Y"}}, {"edge", {"Y","X"}}}});
+    p.evaluate();
+    EXPECT_EQ(popcnt(p.get_bits("reach"), 2), 2u);
+}
+
+TEST(Datalog, SimpleNegation) {
+    auto nodes = make_nodes(5);
+    auto edges = make_edges({{0,1},{1,2}});
+    datalog::program p;
+    p.add_edb("nodes", nodes, {"id"});
+    p.add_edb("edge", edges, {"src","dst"});
+    p.add_idb("reach", 5);
+    p.add_idb("unreach", 5);
+    p.add_rule({"reach", {"X"}, {{"edge", {"X","D"}}}});
+    p.add_rule({"reach", {"X"}, {{"reach", {"Y"}}, {"edge", {"Y","X"}}}});
+    p.add_rule({"unreach", {"X"}, {{"nodes", {"X"}}, {"reach", {"X"}, true}}});
+    p.evaluate();
+    for (int i : {0,1,2}) EXPECT_TRUE(bt(p.get_bits("reach"), i));
+    EXPECT_FALSE(bt(p.get_bits("reach"), 3));
+    for (int i : {0,1,2}) EXPECT_FALSE(bt(p.get_bits("unreach"), i));
+    EXPECT_TRUE(bt(p.get_bits("unreach"), 3));
+    EXPECT_TRUE(bt(p.get_bits("unreach"), 4));
+}
+
+TEST(Datalog, NegationAllReachable) {
+    auto nodes = make_nodes(3);
+    auto edges = make_edges({{0,1},{1,2},{2,0}});
+    datalog::program p;
+    p.add_edb("nodes", nodes, {"id"});
+    p.add_edb("edge", edges, {"src","dst"});
+    p.add_idb("reach", 3);
+    p.add_idb("unreach", 3);
+    p.add_rule({"reach", {"X"}, {{"edge", {"X","D"}}}});
+    p.add_rule({"reach", {"X"}, {{"reach", {"Y"}}, {"edge", {"Y","X"}}}});
+    p.add_rule({"unreach", {"X"}, {{"nodes", {"X"}}, {"reach", {"X"}, true}}});
+    p.evaluate();
+    EXPECT_EQ(popcnt(p.get_bits("reach"), 3), 3u);
+    EXPECT_EQ(popcnt(p.get_bits("unreach"), 3), 0u);
+}
+
+TEST(Datalog, ThreeStrata) {
+    auto nodes = make_nodes(10);
+    datalog::program p;
+    p.add_edb("nodes", nodes, {"id"});
+    p.add_idb("base", 10);
+    p.add_idb("derived", 10);
+    p.add_idb("fin", 10);
+    p.add_rule({"base", {"X"}, {{"nodes", {"X"}}},
+        [](const table& t) -> engine::mask_t {
+            return engine::execute(t, field_matcher<op::lt, "id", 5>{});
+        }, 0});
+    p.add_rule({"derived", {"X"}, {{"nodes", {"X"}}, {"base", {"X"}, true}}});
+    p.add_rule({"fin", {"X"}, {{"nodes", {"X"}}, {"derived", {"X"}, true}}});
+    p.evaluate();
+    EXPECT_EQ(popcnt(p.get_bits("base"), 10), 5u);
+    EXPECT_EQ(popcnt(p.get_bits("derived"), 10), 5u);
+    EXPECT_EQ(popcnt(p.get_bits("fin"), 10), 5u);
+    for (int i = 0; i < 5; ++i)  EXPECT_TRUE(bt(p.get_bits("fin"), i));
+    for (int i = 5; i < 10; ++i) EXPECT_FALSE(bt(p.get_bits("fin"), i));
+}
+
+TEST(Datalog, NaryBinaryPath) {
+    auto edges = make_edges({{0,1},{1,2},{2,3}});
+    datalog::program p;
+    p.add_edb("edge", edges, {"src","dst"});
+    p.add_idb_table("path", {"src","dst"});
+    p.add_rule({"path", {"X","Y"}, {{"edge", {"X","Y"}}}});
+    p.add_rule({"path", {"X","Y"}, {{"path", {"X","Z"}}, {"edge", {"Z","Y"}}}});
+    p.evaluate();
+    auto s = p.get_store("path");
+    EXPECT_EQ(s.nrows, 6u);
+    EXPECT_TRUE(has_fact(s, {0,1}));
+    EXPECT_TRUE(has_fact(s, {0,2}));
+    EXPECT_TRUE(has_fact(s, {0,3}));
+    EXPECT_TRUE(has_fact(s, {1,2}));
+    EXPECT_TRUE(has_fact(s, {1,3}));
+    EXPECT_TRUE(has_fact(s, {2,3}));
+}
+
+TEST(Datalog, NaryPathCycle) {
+    auto edges = make_edges({{0,1},{1,2},{2,0}});
+    datalog::program p;
+    p.add_edb("edge", edges, {"src","dst"});
+    p.add_idb_table("path", {"src","dst"});
+    p.add_rule({"path", {"X","Y"}, {{"edge", {"X","Y"}}}});
+    p.add_rule({"path", {"X","Y"}, {{"path", {"X","Z"}}, {"edge", {"Z","Y"}}}});
+    p.evaluate();
+    auto s = p.get_store("path");
+    EXPECT_EQ(s.nrows, 9u);
+    for (uint32_t i = 0; i < 3; ++i)
+        for (uint32_t j = 0; j < 3; ++j)
+            EXPECT_TRUE(has_fact(s, {i, j})) << "(" << i << "," << j << ")";
+}
+
+TEST(Datalog, NaryDedup) {
+    auto edges = make_edges({{0,1},{0,1},{0,1}});
+    datalog::program p;
+    p.add_edb("edge", edges, {"src","dst"});
+    p.add_idb_table("u", {"a","b"});
+    p.add_rule({"u", {"X","Y"}, {{"edge", {"X","Y"}}}});
+    p.evaluate();
+    EXPECT_EQ(p.get_store("u").nrows, 1u);
+}
+
+TEST(Datalog, Projection) {
+    auto edges = make_edges({{0,1},{0,2},{1,3}});
+    datalog::program p;
+    p.add_edb("edge", edges, {"src","dst"});
+    p.add_idb_table("proj", {"x"});
+    p.add_rule({"proj", {"X"}, {{"edge", {"X","Y"}}}});
+    p.evaluate();
+    auto s = p.get_store("proj");
+    EXPECT_EQ(s.nrows, 2u);
+    EXPECT_TRUE(has_fact(s, {0}));
+    EXPECT_TRUE(has_fact(s, {1}));
+}
+
+TEST(Datalog, TwoTableJoin) {
+    auto r1 = make_table(3, {{"a", {0,1,2}}, {"b", {10,20,30}}});
+    auto r2 = make_table(3, {{"b", {10,20,30}}, {"c", {100,200,300}}});
+    datalog::program p;
+    p.add_edb("R", r1, {"a","b"});
+    p.add_edb("S", r2, {"b","c"});
+    p.add_idb_table("T", {"x","y"});
+    p.add_rule({"T", {"A","C"}, {{"R",{"A","B"}}, {"S",{"B","C"}}}});
+    p.evaluate();
+    auto s = p.get_store("T");
+    EXPECT_EQ(s.nrows, 3u);
+    EXPECT_TRUE(has_fact(s, {0, 100}));
+    EXPECT_TRUE(has_fact(s, {1, 200}));
+    EXPECT_TRUE(has_fact(s, {2, 300}));
+}
+
+TEST(Datalog, TwoTablePartialJoin) {
+    auto r1 = make_table(3, {{"a", {0,1,2}}, {"b", {10,20,30}}});
+    auto r2 = make_table(2, {{"b", {20,40}}, {"c", {200,400}}});
+    datalog::program p;
+    p.add_edb("R", r1, {"a","b"});
+    p.add_edb("S", r2, {"b","c"});
+    p.add_idb_table("T", {"x","y"});
+    p.add_rule({"T", {"A","C"}, {{"R",{"A","B"}}, {"S",{"B","C"}}}});
+    p.evaluate();
+    auto s = p.get_store("T");
+    EXPECT_EQ(s.nrows, 1u);
+    EXPECT_TRUE(has_fact(s, {1, 200}));
+}
+
+TEST(Datalog, SelfJoin) {
+    auto edges = make_edges({{0,1},{1,2},{2,3}});
+    datalog::program p;
+    p.add_edb("edge", edges, {"src","dst"});
+    p.add_idb_table("p2", {"a","b"});
+    p.add_rule({"p2", {"A","C"}, {{"edge",{"A","B"}}, {"edge",{"B","C"}}}});
+    p.evaluate();
+    auto s = p.get_store("p2");
+    EXPECT_EQ(s.nrows, 2u);
+    EXPECT_TRUE(has_fact(s, {0, 2}));
+    EXPECT_TRUE(has_fact(s, {1, 3}));
+}
+
+TEST(Datalog, ThreeWayJoin) {
+    auto r1 = make_table(2, {{"a", {1,2}}, {"b", {10,20}}});
+    auto r2 = make_table(3, {{"b", {10,20,30}}, {"c", {100,200,300}}});
+    auto r3 = make_table(2, {{"c", {100,300}}, {"d", {1000,3000}}});
+    datalog::program p;
+    p.add_edb("R", r1, {"a","b"});
+    p.add_edb("S", r2, {"b","c"});
+    p.add_edb("T", r3, {"c","d"});
+    p.add_idb_table("result", {"x","y"});
+    p.add_rule({"result", {"A","D"}, {{"R",{"A","B"}}, {"S",{"B","C"}}, {"T",{"C","D"}}}});
+    p.evaluate();
+    auto s = p.get_store("result");
+    EXPECT_EQ(s.nrows, 1u);
+    EXPECT_TRUE(has_fact(s, {1, 1000}));
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Benchmarks
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -849,7 +1670,113 @@ static void BM_SemiNaive(benchmark::State& st) {
 }
 BENCHMARK(BM_SemiNaive);
 
-#define RUN_BENCHMARKS 0
+// ═══════════════════════════════════════════════════════════════════════════════
+// Datalog Benchmarks
+// ═══════════════════════════════════════════════════════════════════════════════
+static void BM_Datalog_BaseCase(benchmark::State& st) {
+    size_t n = st.range(0);
+    auto nodes = make_nodes(n);
+    for (auto _ : st) {
+        datalog::program p;
+        p.add_edb("n", nodes, {"id"}); p.add_idb("s", n);
+        p.add_rule({"s", {"X"}, {{"n", {"X"}}}});
+        p.evaluate();
+        benchmark::DoNotOptimize(p.get_bits("s").data());
+    }
+    st.SetItemsProcessed(st.iterations() * (int64_t)n);
+}
+BENCHMARK(BM_Datalog_BaseCase)->RangeMultiplier(10)->Range(1000, 1'000'000);
+
+static void BM_Datalog_UnaryTC(benchmark::State& st) {
+    size_t n = st.range(0);
+    std::vector<std::pair<uint32_t,uint32_t>> es;
+    for (uint32_t i = 0; i < n; ++i) es.push_back({i, i + 1});
+    auto edges = make_edges(std::move(es));
+    for (auto _ : st) {
+        datalog::program p;
+        p.add_edb("edge", edges, {"src","dst"}); p.add_idb("reach", n + 1);
+        p.add_rule({"reach", {"X"}, {{"edge", {"X","D"}}}});
+        p.add_rule({"reach", {"X"}, {{"reach", {"Y"}}, {"edge", {"Y","X"}}}});
+        p.evaluate();
+        benchmark::DoNotOptimize(p.get_bits("reach").data());
+    }
+}
+BENCHMARK(BM_Datalog_UnaryTC)->RangeMultiplier(10)->Range(100, 10'000);
+
+static void BM_Datalog_DenseTC(benchmark::State& st) {
+    std::vector<std::pair<uint32_t,uint32_t>> es;
+    for (uint32_t i = 0; i < 32; ++i)
+        for (uint32_t j = 0; j < 32; ++j)
+            if (i != j) es.push_back({i, j});
+    auto edges = make_edges(std::move(es));
+    for (auto _ : st) {
+        datalog::program p;
+        p.add_edb("edge", edges, {"src","dst"}); p.add_idb("reach", 32);
+        p.add_rule({"reach", {"X"}, {{"edge", {"X","D"}}}});
+        p.add_rule({"reach", {"X"}, {{"reach", {"Y"}}, {"edge", {"Y","X"}}}});
+        p.evaluate();
+        benchmark::DoNotOptimize(p.get_bits("reach").data());
+    }
+}
+BENCHMARK(BM_Datalog_DenseTC);
+
+static void BM_Datalog_NaryPath(benchmark::State& st) {
+    size_t n = st.range(0);
+    std::vector<std::pair<uint32_t,uint32_t>> es;
+    for (uint32_t i = 0; i < n; ++i) es.push_back({i, i + 1});
+    auto edges = make_edges(std::move(es));
+    for (auto _ : st) {
+        datalog::program p;
+        p.add_edb("edge", edges, {"src","dst"});
+        p.add_idb_table("path", {"src","dst"});
+        p.add_rule({"path", {"X","Y"}, {{"edge", {"X","Y"}}}});
+        p.add_rule({"path", {"X","Y"}, {{"path", {"X","Z"}}, {"edge", {"Z","Y"}}}});
+        p.evaluate();
+        benchmark::DoNotOptimize(p.get_store("path").nrows);
+    }
+}
+BENCHMARK(BM_Datalog_NaryPath)->Arg(10)->Arg(20)->Arg(50)->Arg(100);
+
+static void BM_Datalog_Negation(benchmark::State& st) {
+    size_t n = st.range(0);
+    auto nodes = make_nodes(n);
+    std::vector<std::pair<uint32_t,uint32_t>> es;
+    for (uint32_t i = 0; i < n / 10; ++i) es.push_back({i, i + 1});
+    auto edges = make_edges(std::move(es));
+    for (auto _ : st) {
+        datalog::program p;
+        p.add_edb("nodes", nodes, {"id"});
+        p.add_edb("edge", edges, {"src","dst"});
+        p.add_idb("reach", n); p.add_idb("unreach", n);
+        p.add_rule({"reach", {"X"}, {{"edge", {"X","D"}}}});
+        p.add_rule({"reach", {"X"}, {{"reach", {"Y"}}, {"edge", {"Y","X"}}}});
+        p.add_rule({"unreach", {"X"}, {{"nodes", {"X"}}, {"reach", {"X"}, true}}});
+        p.evaluate();
+        benchmark::DoNotOptimize(p.get_bits("unreach").data());
+    }
+    st.SetItemsProcessed(st.iterations() * (int64_t)n);
+}
+BENCHMARK(BM_Datalog_Negation)->RangeMultiplier(10)->Range(1000, 100'000);
+
+static void BM_Datalog_MultiJoin(benchmark::State& st) {
+    size_t n = st.range(0);
+    std::vector<uint32_t> a(n), b(n), c(n);
+    for (uint32_t i = 0; i < n; ++i) { a[i] = i; b[i] = i + (uint32_t)n; c[i] = i + 2*(uint32_t)n; }
+    auto r1 = make_table(n, {{"a", a}, {"b", b}});
+    auto r2 = make_table(n, {{"b", b}, {"c", c}});
+    for (auto _ : st) {
+        datalog::program p;
+        p.add_edb("R", r1, {"a","b"}); p.add_edb("S", r2, {"b","c"});
+        p.add_idb_table("T", {"x","y"});
+        p.add_rule({"T", {"A","C"}, {{"R",{"A","B"}}, {"S",{"B","C"}}}});
+        p.evaluate();
+        benchmark::DoNotOptimize(p.get_store("T").nrows);
+    }
+    st.SetItemsProcessed(st.iterations() * (int64_t)n);
+}
+BENCHMARK(BM_Datalog_MultiJoin)->RangeMultiplier(10)->Range(100, 10'000);
+
+#define RUN_BENCHMARKS 1
 #if RUN_BENCHMARKS
 BENCHMARK_MAIN();
 #else
