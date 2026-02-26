@@ -87,17 +87,17 @@ TEST(Algebra, SimplifyRecursion) {
     static_assert(std::is_same_v<decltype(simplify(raw_or)), lt10>);
 }
 
-TEST(Algebra, SumOfProducts) {
+TEST(Algebra, DNFTest) {
     using A = field_matcher<op::eq, "x", 1>;
     using B = field_matcher<op::eq, "y", 2>;
     using C = field_matcher<op::eq, "z", 3>;
 
     auto expr = and_t{or_t{A{}, B{}}, C{}};
-    auto dnf = sum_of_products(expr);
+    auto dnf = to_dnf(expr);
     static_assert(is_or_v<decltype(dnf)>);
 
     auto absorb = and_t{A{}, or_t{A{}, B{}}};
-    static_assert(std::is_same_v<decltype(sum_of_products(absorb)), A>);
+    static_assert(std::is_same_v<decltype(to_dnf(absorb)), A>);
 }
 
 TEST(Algebra, HST) {
@@ -567,9 +567,9 @@ TEST(GameECS, ComponentFilter) {
     entities.get_col("health").f32[43] = 25.5f;
     entities.set_tag(43, 3);
 
-    auto query = field_matcher<op::ge, fs("level"), 10u>{} &
-                 field_matcher<op::lt, fs("health"), 50.0f>{} &
-                 field_matcher<op::eq, fs("mask"), 8ULL>{};
+    auto query = field_matcher<op::ge, FixedString("level"), 10u>{} &
+                 field_matcher<op::lt, FixedString("health"), 50.0f>{} &
+                 field_matcher<op::eq, FixedString("mask"), 8ULL>{};
 
     auto result = engine::execute(entities, query);
 
@@ -593,7 +593,7 @@ TEST(GameECS, ComponentFilter) {
 //         "quest_boss_unlocked", {"X"}, 
 //         {{"player_data", {"X"}}, {"quest_tutorial_done", {"X"}}},
 //         [](const table& t) { 
-//             return engine::execute(t, field_matcher<op::ge, fs("level"), 10u>{}); 
+//             return engine::execute(t, field_matcher<op::ge, FixedString("level"), 10u>{}); 
 //         }, 
 //         0
 //     });
@@ -619,10 +619,10 @@ TEST(SpatialEngine, BoundingBoxQuery) {
     world.get_col("x").f32[8] = 25.0f;
     world.get_col("y").f32[8] = 35.0f;
 
-    auto box_query = field_matcher<op::ge, fs("x"), 10.0f>{} &
-                     field_matcher<op::lt, fs("x"), 20.0f>{} &
-                     field_matcher<op::ge, fs("y"), 30.0f>{} &
-                     field_matcher<op::lt, fs("y"), 40.0f>{};
+    auto box_query = field_matcher<op::ge, FixedString("x"), 10.0f>{} &
+                     field_matcher<op::lt, FixedString("x"), 20.0f>{} &
+                     field_matcher<op::ge, FixedString("y"), 30.0f>{} &
+                     field_matcher<op::lt, FixedString("y"), 40.0f>{};
 
     auto result = engine::execute(world, box_query);
 
@@ -900,10 +900,10 @@ static void BM_BoundingBox(benchmark::State& st) {
         world.get_col("y").f32[i] = static_cast<float>((i / 1000) % 1000) * 0.1f;
     }
 
-    auto box_query = field_matcher<op::ge, fs("x"), 10.0f>{} &
-                     field_matcher<op::lt, fs("x"), 20.0f>{} &
-                     field_matcher<op::ge, fs("y"), 30.0f>{} &
-                     field_matcher<op::lt, fs("y"), 40.0f>{};
+    auto box_query = field_matcher<op::ge, FixedString("x"), 10.0f>{} &
+                     field_matcher<op::lt, FixedString("x"), 20.0f>{} &
+                     field_matcher<op::ge, FixedString("y"), 30.0f>{} &
+                     field_matcher<op::lt, FixedString("y"), 40.0f>{};
 
     for (auto _ : st) {
         benchmark::DoNotOptimize(engine::execute(world, box_query));
@@ -936,11 +936,11 @@ static void BM_BoundingBox_Bloom(benchmark::State& st) {
     }
 
     // Query includes mask matcher to trigger bloom filter pruning
-    auto box_query = field_matcher<op::eq, fs("mask"), 1ULL>{} &
-                     field_matcher<op::ge, fs("x"), 10.0f>{} &
-                     field_matcher<op::lt, fs("x"), 20.0f>{} &
-                     field_matcher<op::ge, fs("y"), 30.0f>{} &
-                     field_matcher<op::lt, fs("y"), 40.0f>{};
+    auto box_query = field_matcher<op::eq, FixedString("mask"), 1ULL>{} &
+                     field_matcher<op::ge, FixedString("x"), 10.0f>{} &
+                     field_matcher<op::lt, FixedString("x"), 20.0f>{} &
+                     field_matcher<op::ge, FixedString("y"), 30.0f>{} &
+                     field_matcher<op::lt, FixedString("y"), 40.0f>{};
 
     for (auto _ : st) {
         benchmark::DoNotOptimize(engine::execute(world, box_query));
@@ -971,11 +971,11 @@ static void BM_Bloom_Crossover(benchmark::State& st) {
         }
     }
 
-    auto q = field_matcher<op::eq, fs("mask"), 1ULL>{} &
-             field_matcher<op::ge, fs("x"), 10.0f>{} &
-             field_matcher<op::lt, fs("x"), 20.0f>{} &
-             field_matcher<op::ge, fs("y"), 30.0f>{} &
-             field_matcher<op::lt, fs("y"), 40.0f>{};
+    auto q = field_matcher<op::eq, FixedString("mask"), 1ULL>{} &
+             field_matcher<op::ge, FixedString("x"), 10.0f>{} &
+             field_matcher<op::lt, FixedString("x"), 20.0f>{} &
+             field_matcher<op::ge, FixedString("y"), 30.0f>{} &
+             field_matcher<op::lt, FixedString("y"), 40.0f>{};
 
     for (auto _ : st) {
         benchmark::DoNotOptimize(engine::execute(world, q));

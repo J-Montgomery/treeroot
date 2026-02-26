@@ -15,11 +15,11 @@
 #include "simd.hpp"
 
 template<size_t N>
-struct fs {
+struct FixedString {
     char data[N]{};
-    constexpr fs(const char (&s)[N]) { std::copy_n(s, N, data); }
+    constexpr FixedString(const char (&s)[N]) { std::copy_n(s, N, data); }
     template<size_t M>
-    constexpr bool operator==(const fs<M>& o) const {
+    constexpr bool operator==(const FixedString<M>& o) const {
         if constexpr (N != M) return false;
         else { for (size_t i = 0; i < N; ++i) if (data[i] != o.data[i]) return false; return true; }
     }
@@ -163,7 +163,7 @@ public:
     }
 } simplify{};
 
-constexpr inline class sum_of_products_t {
+constexpr inline class to_dnf_t {
 public:
     template<typename M>
     constexpr auto operator()(M const& m) const {
@@ -193,7 +193,7 @@ public:
         }
         else return s;
     }
-} sum_of_products{};
+} to_dnf{};
 
 template<matcher L, matcher R>
 constexpr auto operator&(L l, R r) {
@@ -243,11 +243,11 @@ constexpr auto operator!(M m) { return negate(simplify(m)); }
 
 enum class op { eq, ne, lt, ge };
 
-template<op O, fs Field, auto Val>
+template<op O, FixedString Field, auto Val>
 struct field_matcher {
     using is_matcher = void;
 
-    template<op O2, fs F2, auto V2>
+    template<op O2, FixedString F2, auto V2>
     friend constexpr bool tag_invoke(expr::implies_t, field_matcher const&,
                                      field_matcher<O2,F2,V2> const&) {
         if constexpr (!(Field == F2)) return false;
@@ -282,10 +282,10 @@ struct field_matcher {
     }
 };
 
-template<fs Field, fs Path>
+template<FixedString Field, FixedString Path>
 struct field_hst {
     using is_matcher = void;
-    template<fs F2, fs P2>
+    template<FixedString F2, FixedString P2>
     friend constexpr bool tag_invoke(expr::implies_t, field_hst const&,
                                      field_hst<F2,P2> const&) {
         if constexpr (!(Field == F2)) return false;
@@ -397,7 +397,7 @@ struct engine {
     using mask_t = simd::mask_t;
 
     static mask_t execute(const table& t, expr::matcher auto const& m) {
-        auto sop = expr::sum_of_products(m);
+        auto sop = expr::to_dnf(m);
         uint64_t req = extract_bits(sop);
         size_t nw = simd::num_words(t.rows);
         mask_t result(nw, 0);
@@ -458,7 +458,7 @@ struct engine {
 
     template<size_t CS>
     static mask_t execute(const table_view<CS>& t, expr::matcher auto const& m) {
-        auto sop = expr::sum_of_products(m);
+        auto sop = expr::to_dnf(m);
         uint64_t req = extract_bits(sop);
         size_t nw = simd::num_words(t.rows);
         mask_t result(nw, 0);
@@ -506,9 +506,9 @@ private:
     template<typename M>
     static uint64_t extract_bits(M const&) { return 0; }
 
-    template<op O, fs Field, auto Val>
+    template<op O, FixedString Field, auto Val>
     static uint64_t extract_bits(field_matcher<O, Field, Val> const&) {
-        if constexpr (O == op::eq && Field == fs("mask")) return static_cast<uint64_t>(Val);
+        if constexpr (O == op::eq && Field == FixedString("mask")) return static_cast<uint64_t>(Val);
         else return 0;
     }
     template<expr::matcher L, expr::matcher R>
@@ -591,7 +591,7 @@ private:
         simd::clear_tail(out, nw, c);
     }
 
-    template<op O, fs Field, auto Val>
+    template<op O, FixedString Field, auto Val>
     static void eval_into(const table& t, field_matcher<O,Field,Val> const&,
                           size_t start, size_t count, uint64_t* out, uint64_t*, size_t nw) {
         auto& col = t.get_col(Field.view());
@@ -608,7 +608,7 @@ private:
         else std::fill_n(out, nw, 0);
     }
 
-    template<fs Field, fs Path>
+    template<FixedString Field, FixedString Path>
     static void eval_into(const table& t, field_hst<Field,Path> const&,
                           size_t start, size_t count, uint64_t* out, uint64_t*, size_t nw) {
         auto it = t.dicts.find(std::string(Field.view()));
@@ -680,7 +680,7 @@ private:
         simd::clear_tail(out, nw, c);
     }
 
-    template<size_t CS, op O, fs Field, auto Val>
+    template<size_t CS, op O, FixedString Field, auto Val>
     static void eval_into_view(const table_view<CS>& t, field_matcher<O,Field,Val> const&,
                                size_t start, size_t count, uint64_t* out, uint64_t*, size_t nw) {
         auto& col = t.get_col(Field.view());
@@ -704,7 +704,7 @@ private:
         }
     }
 
-    template<size_t CS, fs Field, fs Path>
+    template<size_t CS, FixedString Field, FixedString Path>
     static void eval_into_view(const table_view<CS>& t, field_hst<Field,Path> const&,
                                size_t start, size_t count, uint64_t* out, uint64_t*, size_t nw) {
         if (!t.dicts) { std::fill_n(out, nw, 0); return; }
