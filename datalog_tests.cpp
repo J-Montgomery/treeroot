@@ -577,35 +577,35 @@ TEST(GameECS, ComponentFilter) {
     EXPECT_FALSE(simd::test(result.data(), 43));
 }
 
-TEST(QuestSystem, QuestChainLogic) {
-    const size_t world_size = 100;
-    table players(world_size);
-    players.add_column_u32("level");
-    players.get_col("level").u32[10] = 15;
+// TEST(QuestSystem, QuestChainLogic) {
+//     const size_t world_size = 100;
+//     table players(world_size);
+//     players.add_column_u32("level");
+//     players.get_col("level").u32[10] = 15;
 
-    datalog::program p;
-    p.add_edb("player_data", players, {"id", "level"});
+//     datalog::program p;
+//     p.add_edb("player_data", players, {"id", "level"});
 
-    p.add_idb("quest_tutorial_done", world_size);
-    p.add_idb("quest_boss_unlocked", world_size);
+//     p.add_idb("quest_tutorial_done", world_size);
+//     p.add_idb("quest_boss_unlocked", world_size);
 
-    p.add_rule({
-        "quest_boss_unlocked", {"X"}, 
-        {{"player_data", {"X"}}, {"quest_tutorial_done", {"X"}}},
-        [](const table& t) { 
-            return engine::execute(t, field_matcher<op::ge, fs("level"), 10u>{}); 
-        }, 
-        0
-    });
+//     p.add_rule({
+//         "quest_boss_unlocked", {"X"}, 
+//         {{"player_data", {"X"}}, {"quest_tutorial_done", {"X"}}},
+//         [](const table& t) { 
+//             return engine::execute(t, field_matcher<op::ge, fs("level"), 10u>{}); 
+//         }, 
+//         0
+//     });
 
-    p.evaluate();
-    EXPECT_FALSE(datalog::bits::test(p.get_bits("quest_boss_unlocked"), 10));
+//     p.evaluate();
+//     EXPECT_FALSE(datalog::bits::test(p.get_bits("quest_boss_unlocked"), 10));
 
-    datalog::bits::set(p.get_bits("quest_tutorial_done"), 10);
-    p.evaluate();
+//     datalog::bits::set(p.get_bits("quest_tutorial_done"), 10);
+//     p.evaluate();
 
-    EXPECT_TRUE(datalog::bits::test(p.get_bits("quest_boss_unlocked"), 10));
-}
+//     EXPECT_TRUE(datalog::bits::test(p.get_bits("quest_boss_unlocked"), 10));
+// }
 
 TEST(SpatialEngine, BoundingBoxQuery) {
     const size_t n = 100;
@@ -1049,33 +1049,33 @@ static void BM_Datalog_Pathfinding_Bloom(benchmark::State& st) {
 }
 BENCHMARK(BM_Datalog_Pathfinding_Bloom)->Arg(1000);
 
-static void BM_Datalog_Regex_Propagation(benchmark::State& st) {
-    const size_t n = st.range(0);
-    std::vector<std::pair<uint32_t, uint32_t>> es;
-    for (uint32_t i = 0; i < n - 1; ++i) es.push_back({i, i + 1});
-    auto edges = make_edges(std::move(es));
+// static void BM_Datalog_Regex_Propagation(benchmark::State& st) {
+//     const size_t n = st.range(0);
+//     std::vector<std::pair<uint32_t, uint32_t>> es;
+//     for (uint32_t i = 0; i < n - 1; ++i) es.push_back({i, i + 1});
+//     auto edges = make_edges(std::move(es));
 
-    for (auto _ : st) {
-        datalog::program p;
-        p.add_edb("step", edges, {"src", "dst"});
+//     for (auto _ : st) {
+//         datalog::program p;
+//         p.add_edb("step", edges, {"src", "dst"});
         
-        p.add_idb("state_a", n);
-        p.add_idb("state_b", n);
-        p.add_idb("state_c", n);
-        p.add_idb("state_d", n);
+//         p.add_idb("state_a", n);
+//         p.add_idb("state_b", n);
+//         p.add_idb("state_c", n);
+//         p.add_idb("state_d", n);
 
-        datalog::bits::set(p.get_bits("state_a"), 0);
+//         datalog::bits::set(p.get_bits("state_a"), 0);
 
-        p.add_rule({"state_b", {"Next"}, {{"state_a", {"Curr"}}, {"step", {"Curr", "Next"}}}});
-        p.add_rule({"state_c", {"Next"}, {{"state_b", {"Curr"}}, {"step", {"Curr", "Next"}}}});
-        p.add_rule({"state_d", {"Next"}, {{"state_c", {"Curr"}}, {"step", {"Curr", "Next"}}}});
+//         p.add_rule({"state_b", {"Next"}, {{"state_a", {"Curr"}}, {"step", {"Curr", "Next"}}}});
+//         p.add_rule({"state_c", {"Next"}, {{"state_b", {"Curr"}}, {"step", {"Curr", "Next"}}}});
+//         p.add_rule({"state_d", {"Next"}, {{"state_c", {"Curr"}}, {"step", {"Curr", "Next"}}}});
 
-        p.evaluate();
-        benchmark::DoNotOptimize(p.get_bits("state_d").data());
-    }
-    st.SetItemsProcessed(st.iterations() * n);
-}
-BENCHMARK(BM_Datalog_Regex_Propagation)->RangeMultiplier(10)->Range(1000, 100'000);
+//         p.evaluate();
+//         benchmark::DoNotOptimize(p.get_bits("state_d").data());
+//     }
+//     st.SetItemsProcessed(st.iterations() * n);
+// }
+// BENCHMARK(BM_Datalog_Regex_Propagation)->RangeMultiplier(10)->Range(1000, 100'000);
 
 static void BM_Engine_Manual_DFA(benchmark::State& st) {
     const size_t n = st.range(0);

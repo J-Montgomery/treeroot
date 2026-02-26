@@ -1,25 +1,19 @@
 #pragma once
 
-#include <cstdint>
 #include <cstddef>
-
+#include <cstdint>
 #include <functional>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
 #include "engine.hpp"
+#include "simd.hpp"
 
 namespace datalog {
 
 using mask_t = engine::mask_t;
-
-namespace bits {
-    inline size_t words(size_t n) { return (n + 63) / 64; }
-    inline bool test(const mask_t& m, size_t i) { return i / 64 < m.size() && (m[i / 64] & (1ULL << (i % 64))); }
-    inline void set(mask_t& m, size_t i) { if (i / 64 < m.size()) m[i / 64] |= (1ULL << (i % 64)); }
-    inline void clear_tail(mask_t& m, size_t n) { if (n % 64 && !m.empty()) m.back() &= (1ULL << (n % 64)) - 1; }
-    inline bool any(const mask_t& m) { for (auto w : m) if (w) return true; return false; }
-}
 
 struct atom { std::string rel; std::vector<std::string> vars; bool negated = false; };
 
@@ -31,24 +25,29 @@ struct rule_def {
     size_t filter_body = 0;
 };
 
-// A basic monadic datalog impl
 class program {
     struct edb_entry { std::string name; const table* tbl; std::vector<std::string> cols; };
     struct idb_entry { std::string name; size_t universe; mask_t mask; };
 
     friend class batch_program;
-    std::vector<edb_entry> edbs_;
-    std::vector<idb_entry> idbs_;
-    std::vector<rule_def> rules_;
+
+    std::vector<edb_entry>                  edbs_;
+    std::vector<idb_entry>                  idbs_;
+    std::vector<rule_def>                   rules_;
+    std::vector<mask_t>                     filter_cache_;
+    std::unordered_map<std::string, size_t> idb_index_;
 
     const edb_entry* edb(const std::string& n) const {
-        for (auto& e : edbs_) if (e.name == n) return &e; return nullptr;
+        for (auto& e : edbs_) if (e.name == n) return &e;
+        return nullptr;
     }
     idb_entry* idb(const std::string& n) {
-        for (auto& e : idbs_) if (e.name == n) return &e; return nullptr;
+        auto it = idb_index_.find(n);
+        return it != idb_index_.end() ? &idbs_[it->second] : nullptr;
     }
     const idb_entry* idb(const std::string& n) const {
-        for (auto& e : idbs_) if (e.name == n) return &e; return nullptr;
+        auto it = idb_index_.find(n);
+        return it != idb_index_.end() ? &idbs_[it->second] : nullptr;
     }
 
     static int shared_edb_col(const atom& ea, const atom& ba) {
@@ -58,7 +57,19 @@ class program {
         return -1;
     }
 
-    void fire(const rule_def& rule, const std::string* dr, const mask_t* db, mask_t& out) {
+    void precompute_filters() {
+        filter_cache_.assign(rules_.size(), {});
+        for (size_t i = 0; i < rules_.size(); ++i) {
+            auto& r = rules_[i];
+            if (!r.filter || r.filter_body >= r.body.size()) continue;
+            auto* ed = edb(r.body[r.filter_body].rel);
+            if (ed) filter_cache_[i] = r.filter(*ed->tbl);
+        }
+    }
+
+    void fire(size_t rule_idx, const std::string* dr, const mask_t* db, mask_t& out) {
+        const rule_def& rule = rules_[rule_idx];
+
         size_t ei = SIZE_MAX;
         for (size_t i = 0; i < rule.body.size(); ++i)
             if (edb(rule.body[i].rel)) { ei = i; break; }
@@ -71,49 +82,49 @@ class program {
                 auto* p = idb(ba.rel);
                 if (!p) continue;
                 const mask_t& b = (dr && ba.rel == *dr && db) ? *db : p->mask;
-                if (ba.negated) {
-                    for (size_t i = 0; i < w; ++i) res[i] &= ~b[i];
-                } else {
-                    for (size_t i = 0; i < w; ++i) res[i] &= b[i];
-                }
+                if (ba.negated)
+                    simd::bandnot(res.data(), b.data(), w);
+                else
+                    simd::band(res.data(), b.data(), w);
             }
-            for (size_t i = 0; i < w; ++i) out[i] |= res[i];
+            simd::bor(out.data(), res.data(), w);
             return;
         }
 
-        auto& ea = rule.body[ei];
-        auto* ed = edb(ea.rel);
-        const table& t = *ed->tbl;
-        size_t n = t.rows, w = bits::words(n);
+        auto& ea         = rule.body[ei];
+        auto* ed         = edb(ea.rel);
+        const table& t   = *ed->tbl;
+        size_t n         = t.rows;
+        size_t w         = simd::num_words(n);
 
         mask_t rm(w, ~0ULL);
-        bits::clear_tail(rm, n);
+        simd::clear_tail(rm.data(), w, n);
 
         if (rule.filter && rule.filter_body == ei) {
-            auto f = rule.filter(t);
-            for (size_t i = 0; i < w; ++i) rm[i] &= f[i];
+            const mask_t& f = filter_cache_[rule_idx];
+            if (!f.empty()) simd::band(rm.data(), f.data(), w);
         }
 
         for (size_t i = 0; i < rule.body.size(); ++i) {
             if (i == ei) continue;
             auto& ba = rule.body[i];
-            auto* p = idb(ba.rel);
+            auto*  p = idb(ba.rel);
             if (!p) continue;
 
-            const mask_t& b = (dr && ba.rel == *dr && db) ? *db : p->mask;
-            int ec = shared_edb_col(ea, ba);
+            const mask_t& b  = (dr && ba.rel == *dr && db) ? *db : p->mask;
+            int           ec = shared_edb_col(ea, ba);
             if (ec < 0) continue;
 
-            auto& col = t.get_col(ed->cols[ec]).u32;
+            const auto& col = t.get_col(ed->cols[static_cast<size_t>(ec)]).u32;
             mask_t sj(w, 0);
             for (size_t r = 0; r < n; ++r)
-                if (bits::test(b, col[r])) sj[r / 64] |= 1ULL << (r % 64);
+                if (simd::test(b.data(), col[r])) sj[r / 64] |= 1ULL << (r % 64);
 
             if (ba.negated) {
-                for (size_t j = 0; j < w; ++j) sj[j] = ~sj[j];
-                bits::clear_tail(sj, n);
+                simd::bnot(sj.data(), w);
+                simd::clear_tail(sj.data(), w, n);
             }
-            for (size_t j = 0; j < w; ++j) rm[j] &= sj[j];
+            simd::band(rm.data(), sj.data(), w);
         }
 
         int pc = -1;
@@ -121,10 +132,10 @@ class program {
             if (ea.vars[j] == rule.head_vars[0]) { pc = (int)j; break; }
         if (pc < 0) return;
 
-        auto& pcol = t.get_col(ed->cols[pc]).u32;
+        const auto& pcol = t.get_col(ed->cols[static_cast<size_t>(pc)]).u32;
         for (size_t r = 0; r < n; ++r)
             if (rm[r / 64] & (1ULL << (r % 64)))
-                bits::set(out, pcol[r]);
+                simd::set(out.data(), pcol[r]);
     }
 
     struct stratum_t { std::vector<size_t> rule_ids; };
@@ -166,45 +177,47 @@ class program {
             (is_recursive(rules_[ri]) ? rec : base).push_back(ri);
 
         for (size_t ri : base) {
-            auto& r = rules_[ri]; auto* h = idb(r.head);
-            fire(r, nullptr, nullptr, h->mask);
+            auto* h = idb(rules_[ri].head);
+            fire(ri, nullptr, nullptr, h->mask);
         }
         if (rec.empty()) return;
 
-        std::unordered_set<std::string> inv;
+        std::unordered_set<std::string> involved;
         for (size_t ri : rec) {
-            inv.insert(rules_[ri].head);
+            involved.insert(rules_[ri].head);
             for (auto& a : rules_[ri].body)
-                if (!a.negated && idb(a.rel)) inv.insert(a.rel);
+                if (!a.negated && idb(a.rel)) involved.insert(a.rel);
         }
 
-        std::unordered_map<std::string, mask_t> deltas;
-        for (auto& nm : inv) deltas[nm] = idb(nm)->mask;
+        std::unordered_map<std::string, mask_t> deltas, accum;
+        for (const auto& nm : involved) {
+            auto* p = idb(nm);
+            deltas[nm] = p->mask;
+            accum[nm].assign(p->mask.size(), 0);
+        }
 
         for (bool any_new = true; any_new;) {
             any_new = false;
-            std::unordered_map<std::string, mask_t> accum;
-            for (auto& nm : inv) accum[nm].resize(idb(nm)->mask.size(), 0);
+            for (auto& [nm, ac] : accum) std::fill(ac.begin(), ac.end(), 0);
 
             for (size_t ri : rec) {
                 auto& rule = rules_[ri];
                 for (auto& ba : rule.body) {
                     if (ba.negated || !idb(ba.rel)) continue;
-                    std::string dn = ba.rel;
-                    auto& d = deltas[dn];
-                    fire(rule, &dn, &d, accum[rule.head]);
+                    fire(ri, &ba.rel, &deltas[ba.rel], accum[rule.head]);
                     break;
                 }
             }
 
-            for (auto& nm : inv) {
-                auto* p = idb(nm); auto& ac = accum[nm];
-                for (size_t w = 0; w < ac.size(); ++w) ac[w] &= ~p->mask[w];
-                if (bits::any(ac)) {
+            for (const auto& nm : involved) {
+                auto* p  = idb(nm);
+                auto& ac = accum[nm];
+                simd::bandnot(ac.data(), p->mask.data(), ac.size());
+                if (simd::any(ac.data(), ac.size())) {
                     any_new = true;
-                    for (size_t w = 0; w < ac.size(); ++w) p->mask[w] |= ac[w];
+                    simd::bor(p->mask.data(), ac.data(), ac.size());
                 }
-                deltas[nm] = std::move(ac);
+                std::swap(deltas[nm], ac);
             }
         }
     }
@@ -213,15 +226,25 @@ public:
     void add_edb(std::string name, const table& t, std::vector<std::string> cols) {
         edbs_.push_back({std::move(name), &t, std::move(cols)});
     }
+
     void add_idb(std::string name, size_t universe) {
-        idb_entry e; e.name = std::move(name); e.universe = universe;
-        e.mask.resize(bits::words(universe), 0);
+        idb_index_[name] = idbs_.size();
+        idb_entry e;
+        e.name     = std::move(name);
+        e.universe = universe;
+        e.mask.assign(simd::num_words(universe), 0);
         idbs_.push_back(std::move(e));
     }
-    void add_rule(rule_def r) { rules_.push_back(std::move(r)); }
-    void evaluate() { auto ss = stratify(); for (auto& s : ss) eval_stratum(s); }
 
-    mask_t& get_bits(const std::string& n) { return idb(n)->mask; }
+    void add_rule(rule_def r) { rules_.push_back(std::move(r)); }
+
+    void evaluate() {
+        precompute_filters();
+        auto ss = stratify();
+        for (auto& s : ss) eval_stratum(s);
+    }
+
+    mask_t&       get_bits(const std::string& n)       { return idb(n)->mask; }
     const mask_t& get_bits(const std::string& n) const { return idb(n)->mask; }
 };
 
