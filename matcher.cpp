@@ -112,7 +112,6 @@ public:
         return 0; 
     }
 
-    // Returns [inclusive_min, exclusive_max)
     std::pair<uint32_t, uint32_t> get_prefix_range(std::string_view prefix) const {
         auto it_start = std::lower_bound(strings_.begin(), strings_.end(), prefix);
         std::string upper = std::string(prefix);
@@ -366,6 +365,32 @@ struct field_hst {
 // Columnar Table
 // ═══════════════════════════════════════════════════════════════════════════════
 
+struct column_view {
+    const float* f32 = nullptr;
+    const uint32_t* u32 = nullptr;
+    const uint64_t* u64 = nullptr;
+};
+
+template <size_t CS = 1024>
+struct table_view {
+    size_t rows = 0;
+    size_t chunk_size = CS;
+    std::unordered_map<std::string_view, column_view> cols;
+    const std::unordered_map<std::string, hierarchy_dict>* dicts = nullptr;
+    const uint64_t* chunk_summaries = nullptr;
+    size_t chunk_summaries_count = 0;
+
+    size_t num_chunks() const { return rows ? (rows + chunk_size - 1) / chunk_size : 0; }
+
+    const column_view& get_col(std::string_view name) const {
+        auto it = cols.find(name);
+        if (it == cols.end()) throw std::runtime_error("no col: " + std::string(name));
+        return it->second;
+    }
+
+    bool chunk_summaries_empty() const { return chunk_summaries == nullptr || chunk_summaries_count == 0; }
+};
+
 struct table {
     size_t rows = 0;
     size_t chunk_size = 1024;
@@ -375,6 +400,14 @@ struct table {
         std::vector<uint32_t> u32;
         std::vector<float>    f32;
         std::vector<uint64_t> u64;
+
+        operator column_view() const noexcept {
+            return {
+                f32.empty() ? nullptr : f32.data(),
+                u32.empty() ? nullptr : u32.data(),
+                u64.empty() ? nullptr : u64.data()
+            };
+        }
     };
 
     std::vector<column>   cols;
@@ -391,13 +424,15 @@ struct table {
     }
 
     size_t num_chunks() const { return rows ? (rows + chunk_size - 1) / chunk_size : 0; }
+
     column&       get_col(std::string_view n)       { for (auto& c:cols) if (c.name==n) return c; throw std::runtime_error(std::string("no col: ") + std::string(n)); }
     const column& get_col(std::string_view n) const { for (auto& c:cols) if (c.name==n) return c; throw std::runtime_error(std::string("no col: ") + std::string(n)); }
 
+    bool chunk_summaries_empty() const { return chunk_summaries.empty(); }
+
     void add_column_u32(std::string_view n, uint32_t d=0) { cols.push_back({n, std::vector<uint32_t>(rows,d), {}, {}}); }
     void add_column_f32(std::string_view n, float d=0.f)  { cols.push_back({n, {}, std::vector<float>(rows,d), {}}); }
-    
-    // Interns strings immediately.
+
     void add_column_hst(std::string_view n, const std::vector<std::string>& vals) {
         hierarchy_dict dict(vals.begin(), vals.end());
         std::vector<uint32_t> ids(rows);
@@ -411,29 +446,74 @@ struct table {
         get_col("mask").u64[eid] |= bit;
         chunk_summaries[eid / chunk_size] |= bit;
     }
+
+    template<size_t CS = 1024>
+    table_view<CS> view() const {
+        table_view<CS> tv;
+        tv.rows = rows;
+        tv.chunk_size = chunk_size;
+        for (const auto& c : cols) {
+            tv.cols[c.name] = c;
+        }
+        tv.dicts = &dicts;
+        tv.chunk_summaries = chunk_summaries.empty() ? nullptr : chunk_summaries.data();
+        tv.chunk_summaries_count = chunk_summaries.size();
+        return tv;
+    }
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Column Access Helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+namespace detail {
+
+template<typename Col>
+const uint32_t* get_u32_ptr(const Col& c, size_t start = 0) {
+    if constexpr (requires { c.u32.data(); })
+        return c.u32.empty() ? nullptr : c.u32.data() + start;
+    else
+        return c.u32 ? c.u32 + start : nullptr;
+}
+
+template<typename Col>
+const float* get_f32_ptr(const Col& c, size_t start = 0) {
+    if constexpr (requires { c.f32.data(); })
+        return c.f32.empty() ? nullptr : c.f32.data() + start;
+    else
+        return c.f32 ? c.f32 + start : nullptr;
+}
+
+template<typename Col>
+const uint64_t* get_u64_ptr(const Col& c, size_t start = 0) {
+    if constexpr (requires { c.u64.data(); })
+        return c.u64.empty() ? nullptr : c.u64.data() + start;
+    else
+        return c.u64 ? c.u64 + start : nullptr;
+}
+
+template<typename T> inline constexpr bool needs_scratch = false;
+template<typename L, typename R> inline constexpr bool needs_scratch<match::and_t<L,R>> = true;
+template<typename L, typename R> inline constexpr bool needs_scratch<match::or_t<L,R>> = true;
+template<typename M> inline constexpr bool needs_scratch<match::not_t<M>> = needs_scratch<M>;
+
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Execution Engine
 // ═══════════════════════════════════════════════════════════════════════════════
 
-namespace detail {
-template<typename T> inline constexpr bool needs_scratch = false;
-template<typename L, typename R> inline constexpr bool needs_scratch<match::and_t<L,R>> = true;
-template<typename L, typename R> inline constexpr bool needs_scratch<match::or_t<L,R>> = true;
-template<typename M> inline constexpr bool needs_scratch<match::not_t<M>> = needs_scratch<M>;
-}
-
 struct engine {
     using mask_t = simd::mask_t;
 
-    static mask_t execute(const table& t, match::matcher auto const& m) {
+    template<typename Table, match::matcher M>
+    static mask_t execute(const Table& t, M const& m) {
         auto sop = match::sum_of_products(m);
         uint64_t req = extract_bits(sop);
         size_t nw = simd::num_words(t.rows);
         mask_t result(nw, 0);
 
-        if (req == 0 || t.chunk_summaries.empty()) {
+        if (req == 0 || t.chunk_summaries_empty()) {
             mask_t scratch(nw);
             eval_into(t, sop, 0, t.rows, result.data(), scratch.data(), nw);
         } else {
@@ -453,13 +533,15 @@ struct engine {
         return result;
     }
 
-    static match::field_in semi_join(const table& t, match::matcher auto const& q,
+    template<typename Table, match::matcher M>
+    static match::field_in semi_join(const Table& t, M const& q,
                                      std::string_view fk_field) {
         return {fk_field, std::make_shared<mask_t>(execute(t, q))};
     }
 
-    static match::field_in semi_naive_join(const table& t,
-                                           match::matcher auto const& seed,
+    template<typename Table, match::matcher M>
+    static match::field_in semi_naive_join(const Table& t,
+                                           M const& seed,
                                            std::string_view fk_field,
                                            std::string_view id_field = "id") {
         auto delta = execute(t, seed);
@@ -477,13 +559,19 @@ struct engine {
 
     enum class agg { sum, max, min, mean, count };
 
-    static double aggregate(const table& t, match::matcher auto const& q,
+    template<typename Table, match::matcher M>
+    static double aggregate(const Table& t, M const& q,
                             std::string_view col, agg op) {
         auto mask = execute(t, q);
         auto& c = t.get_col(col);
-        if (!c.f32.empty()) return agg_impl(mask, c.f32, op, t.rows);
-        if (!c.u32.empty()) return agg_impl(mask, c.u32, op, t.rows);
-        if (!c.u64.empty()) return agg_impl(mask, c.u64, op, t.rows);
+
+        const float* f32 = detail::get_f32_ptr(c);
+        const uint32_t* u32 = detail::get_u32_ptr(c);
+        const uint64_t* u64 = detail::get_u64_ptr(c);
+
+        if (f32) return agg_impl(mask, f32, op, t.rows);
+        if (u32) return agg_impl(mask, u32, op, t.rows);
+        if (u64) return agg_impl(mask, u64, op, t.rows);
         return 0.0;
     }
 
@@ -504,8 +592,8 @@ private:
         return (l && r) ? (l & r) : 0;
     }
 
-    template<typename T>
-    static double agg_impl(const mask_t& mask, const std::vector<T>& data,
+    template<typename Data>
+    static double agg_impl(const mask_t& mask, const Data* data,
                            agg op, size_t rows) {
         if (op == agg::count) return (double)simd::popcount(mask.data(), mask.size());
         double r = 0; size_t n = 0; bool first = true;
@@ -520,16 +608,19 @@ private:
         return (op == agg::mean && n) ? r / n : r;
     }
 
-    static void eval_into(const table&, match::always_t, size_t, size_t count,
+    template<typename Table>
+    static void eval_into(const Table&, match::always_t, size_t, size_t count,
                           uint64_t* out, uint64_t*, size_t nw) {
         std::fill_n(out, nw, ~0ULL);
         simd::clear_tail(out, nw, count);
     }
-    static void eval_into(const table&, match::never_t, size_t, size_t,
+
+    template<typename Table>
+    static void eval_into(const Table&, match::never_t, size_t, size_t,
                           uint64_t* out, uint64_t*, size_t nw) { std::fill_n(out, nw, 0); }
 
-    template<match::matcher L, match::matcher R>
-    static void eval_into(const table& t, match::and_t<L,R> const& a,
+    template<typename Table, match::matcher L, match::matcher R>
+    static void eval_into(const Table& t, match::and_t<L,R> const& a,
                           size_t s, size_t c, uint64_t* out, uint64_t* scratch, size_t nw) {
         eval_into(t, a.lhs, s, c, out, scratch, nw);
         if constexpr (detail::needs_scratch<R>) {
@@ -540,8 +631,8 @@ private:
         simd::band(out, scratch, nw);
     }
 
-    template<match::matcher L, match::matcher R>
-    static void eval_into(const table& t, match::or_t<L,R> const& o,
+    template<typename Table, match::matcher L, match::matcher R>
+    static void eval_into(const Table& t, match::or_t<L,R> const& o,
                           size_t s, size_t c, uint64_t* out, uint64_t* scratch, size_t nw) {
         eval_into(t, o.lhs, s, c, out, scratch, nw);
         if constexpr (detail::needs_scratch<R>) {
@@ -552,56 +643,109 @@ private:
         simd::bor(out, scratch, nw);
     }
 
-    template<match::matcher M>
-    static void eval_into(const table& t, match::not_t<M> const& n,
+    template<typename Table, match::matcher M>
+    static void eval_into(const Table& t, match::not_t<M> const& n,
                           size_t s, size_t c, uint64_t* out, uint64_t* scratch, size_t nw) {
         eval_into(t, n.m, s, c, out, scratch, nw);
         simd::bnot(out, nw);
         simd::clear_tail(out, nw, c);
     }
 
-    template<op O, fs Field, auto Val>
-    static void eval_into(const table& t, field_matcher<O,Field,Val> const&,
-                          size_t start, size_t count, uint64_t* out, uint64_t*, size_t nw) {
+    template<typename Table, op O, fs Field, auto Val>
+    static void eval_into(const Table& t, field_matcher<O,Field,Val> const&,
+                        size_t start, size_t count, uint64_t* out, uint64_t*, size_t nw) {
         auto& col = t.get_col(Field.view());
-        auto do_cmp = [&]<typename T>(const std::vector<T>& d) {
-            const T* p = d.data() + start;
-            if constexpr (O==op::eq) simd::cmp_eq(out, p, (T)Val, count);
-            if constexpr (O==op::ne) simd::cmp_ne(out, p, (T)Val, count);
-            if constexpr (O==op::lt) simd::cmp_lt(out, p, (T)Val, count);
-            if constexpr (O==op::ge) simd::cmp_ge(out, p, (T)Val, count);
-        };
-        if      (!col.u32.empty()) do_cmp(col.u32);
-        else if (!col.f32.empty()) do_cmp(col.f32);
-        else if (!col.u64.empty()) do_cmp(col.u64);
-        else std::fill_n(out, nw, 0);
+
+        const uint32_t* p32 = get_u32_ptr(col, start);
+        const float* pf32 = get_f32_ptr(col, start);
+        const uint64_t* p64 = get_u64_ptr(col, start);
+
+        if (p32) {
+            if constexpr (O==op::eq) simd::cmp_eq(out, p32, (uint32_t)Val, count);
+            if constexpr (O==op::ne) simd::cmp_ne(out, p32, (uint32_t)Val, count);
+            if constexpr (O==op::lt) simd::cmp_lt(out, p32, (uint32_t)Val, count);
+            if constexpr (O==op::ge) simd::cmp_ge(out, p32, (uint32_t)Val, count);
+        } else if (pf32) {
+            if constexpr (O==op::eq) simd::cmp_eq(out, pf32, (float)Val, count);
+            if constexpr (O==op::ne) simd::cmp_ne(out, pf32, (float)Val, count);
+            if constexpr (O==op::lt) simd::cmp_lt(out, pf32, (float)Val, count);
+            if constexpr (O==op::ge) simd::cmp_ge(out, pf32, (float)Val, count);
+        } else if (p64) {
+            if constexpr (O==op::eq) simd::cmp_eq(out, p64, (uint64_t)Val, count);
+            if constexpr (O==op::ne) simd::cmp_ne(out, p64, (uint64_t)Val, count);
+            if constexpr (O==op::lt) simd::cmp_lt(out, p64, (uint64_t)Val, count);
+            if constexpr (O==op::ge) simd::cmp_ge(out, p64, (uint64_t)Val, count);
+        } else {
+            std::fill_n(out, nw, 0);
+        }
     }
 
-    template<fs Field, fs Path>
-    static void eval_into(const table& t, field_hst<Field,Path> const&,
-                          size_t start, size_t count, uint64_t* out, uint64_t*, size_t nw) {
-        auto it = t.dicts.find(std::string(Field.view()));
-        if (it == t.dicts.end()) { std::fill_n(out, nw, 0); return; }
-        
-        auto [low, high] = it->second.get_prefix_range(Path.view());
+    template<typename Table, fs Field, fs Path>
+    static void eval_into(const Table& t, field_hst<Field,Path> const&,
+                        size_t start, size_t count, uint64_t* out, uint64_t*, size_t nw) {
+        auto it = get_dict(t, Field.view());
+        if (!it) { std::fill_n(out, nw, 0); return; }
+
+        auto [low, high] = it->get_prefix_range(Path.view());
         if (low == high) { std::fill_n(out, nw, 0); return; }
 
-        auto& col = t.get_col(Field.view()).u32;
-        const uint32_t* p = col.data() + start;
+        const uint32_t* p = get_u32_ptr(t.get_col(Field.view()), start);
+        if (!p) { std::fill_n(out, nw, 0); return; }
+
         simd::cmp_fill(out, p, 0, count, [=](uint32_t v, auto) {
             return v >= low && v < high;
         });
     }
 
-    static void eval_into(const table& t, match::field_in const& f,
+    template<typename Table>
+    static void eval_into(const Table& t, match::field_in const& f,
                           size_t start, size_t count, uint64_t* out, uint64_t*, size_t nw) {
         std::fill_n(out, nw, 0);
-        auto& d = t.get_col(f.field).u32;
+        auto& col = t.get_col(f.field);
+        const uint32_t* d = detail::get_u32_ptr(col);
+        if (!d) return;
+
         auto& bm = *f.bitmap;
         for (size_t i = 0; i < count; ++i) {
             uint32_t v = d[start + i];
             if (v / 64 < bm.size() && simd::test(bm.data(), v)) simd::set(out, i);
         }
+    }
+
+    template<typename Table>
+    static const hierarchy_dict* get_dict(const Table& t, std::string_view field) {
+        if constexpr (std::is_pointer_v<decltype(t.dicts)>) {
+            if (!t.dicts) return nullptr;
+            auto it = t.dicts->find(std::string(field));
+            return it != t.dicts->end() ? &it->second : nullptr;
+        } else {
+            auto it = t.dicts.find(std::string(field));
+            return it != t.dicts.end() ? &it->second : nullptr;
+        }
+    }
+
+    template<typename Col>
+    static const uint32_t* get_u32_ptr(const Col& c, size_t start = 0) {
+        if constexpr (requires { c.u32.data(); })
+            return c.u32.empty() ? nullptr : c.u32.data() + start;
+        else
+            return c.u32 ? c.u32 + start : nullptr;
+    }
+
+    template<typename Col>
+    static const float* get_f32_ptr(const Col& c, size_t start = 0) {
+        if constexpr (requires { c.f32.data(); })
+            return c.f32.empty() ? nullptr : c.f32.data() + start;
+        else
+            return c.f32 ? c.f32 + start : nullptr;
+    }
+
+    template<typename Col>
+    static const uint64_t* get_u64_ptr(const Col& c, size_t start = 0) {
+        if constexpr (requires { c.u64.data(); })
+            return c.u64.empty() ? nullptr : c.u64.data() + start;
+        else
+            return c.u64 ? c.u64 + start : nullptr;
     }
 };
 
@@ -663,7 +807,6 @@ class program {
             if (edb(rule.body[i].rel)) { ei = i; break; }
 
         if (ei == SIZE_MAX) {
-            // Pure IDB rule (0 EDBs) - Bitwise intersection
             if (rule.body.empty()) return;
             size_t w = out.size();
             mask_t res(w, ~0ULL);
@@ -681,7 +824,6 @@ class program {
             return;
         }
 
-        // 1-EDB rule
         auto& ea = rule.body[ei];
         auto* ed = edb(ea.rel);
         const table& t = *ed->tbl;
@@ -747,7 +889,7 @@ class program {
             }
         }
         int mx = 0;
-        for (auto& [_, s] : sn) mx = std::max(mx, s);
+        for (auto& [k, s] : sn) mx = std::max(mx, s); 
         std::vector<stratum_t> res(mx + 1);
         for (size_t i = 0; i < rules_.size(); ++i) {
             int s = sn[rules_[i].head];
@@ -896,7 +1038,6 @@ TEST(Algebra, OrImpliesM) {
     using eq3  = field_matcher<op::eq, "x", 3>;
     using lt10 = field_matcher<op::lt, "x", 10>;
 
-    // Both eq5 and eq3 imply lt10 → (eq5|eq3) & lt10 simplifies to (eq5|eq3)
     auto result = (eq5{} | eq3{}) & lt10{};
     static_assert(std::is_same_v<decltype(result), or_t<eq5, eq3>>);
 }
@@ -909,11 +1050,9 @@ TEST(Algebra, Contrapositive) {
     auto neg_child  = !child{};
     static_assert(is_not_v<decltype(neg_parent)>);
 
-    // child ⟹ parent, so by contrapositive ¬parent ⟹ ¬child
     static_assert( implies(neg_parent, neg_child));
     static_assert(!implies(neg_child, neg_parent));
 
-    // Subsumption via contrapositive: ¬parent & ¬child → ¬parent
     auto result = neg_parent & neg_child;
     static_assert(std::is_same_v<decltype(result), decltype(neg_parent)>);
 }
@@ -922,7 +1061,6 @@ TEST(Algebra, SimplifyRecursion) {
     using eq5  = field_matcher<op::eq, "x", 5>;
     using lt10 = field_matcher<op::lt, "x", 10>;
 
-    // Raw and_t/or_t (not built through operators) must still simplify
     auto raw_and = and_t{eq5{}, lt10{}};
     static_assert(is_and_v<decltype(raw_and)>);
     static_assert(std::is_same_v<decltype(simplify(raw_and)), eq5>);
@@ -951,8 +1089,6 @@ TEST(Algebra, HST) {
     static_assert(std::is_same_v<decltype(child{} & parent{}), child>);
     static_assert(is_and_v<decltype(child{} & other{})>);
 }
-
-// ── Runtime Engine ──
 
 TEST(Engine, BasicExecution) {
     table t(5);
@@ -1045,8 +1181,6 @@ TEST(Engine, BloomFilterSkip) {
 }
 
 TEST(Engine, BloomFilterDNF) {
-    // After DNF, top-level or_t — bloom skip should still work via
-    // extract_bits intersecting both branches' required mask bits.
     table t(10240, 1024);
     t.add_column_u32("dur", 100); t.add_column_u32("sp", 0);
     for (int i = 0; i < 5; ++i) { t.set_tag(i, 0); t.set_tag(i, 1); }
@@ -1090,12 +1224,84 @@ TEST(Engine, NegativeJoin) {
     for (size_t i=5;i<10;++i) EXPECT_FALSE(simd::test(r.data(),i));
 }
 
+TEST(Engine, TableViewIntegration) {
+    std::vector<uint32_t> ids = {10, 20, 30, 40, 50};
+    std::vector<uint32_t> scores = {1, 2, 1, 2, 1};
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Datalog Unit Tests
-// ═══════════════════════════════════════════════════════════════════════════════
+    table_view<> tv;
+    tv.rows = 5;
+    tv.chunk_size = 1024;
+    tv.cols["id"] = {nullptr, ids.data(), nullptr};
+    tv.cols["s"] = {nullptr, scores.data(), nullptr};
 
-// ── Unary base cases ─────────────────────────────────────────────────────────
+    auto r = engine::execute(tv, field_matcher<op::eq,"s",2>{});
+    EXPECT_FALSE(simd::test(r.data(),0));
+    EXPECT_TRUE (simd::test(r.data(),1));
+    EXPECT_TRUE (simd::test(r.data(),3));
+    EXPECT_FALSE(simd::test(r.data(),4));
+}
+
+TEST(Engine, TableViewCompound) {
+    std::vector<uint32_t> ids = {10, 20, 30, 40, 50};
+    std::vector<float> values = {1.0f, 25.0f, 30.0f, 15.0f, 50.0f};
+
+    table_view<> tv;
+    tv.rows = 5;
+    tv.cols["id"] = {nullptr, ids.data(), nullptr};
+    tv.cols["val"] = {values.data(), nullptr, nullptr};
+
+    auto q = field_matcher<op::lt,"id",40>{} & field_matcher<op::ge,"val",20.0f>{};
+    auto r = engine::execute(tv, q);
+    EXPECT_TRUE (simd::test(r.data(),1));
+    EXPECT_TRUE (simd::test(r.data(),2));
+    EXPECT_FALSE(simd::test(r.data(),3));
+}
+
+TEST(Engine, TableToViewConversion) {
+    table t(5);
+    t.add_column_u32("s"); t.get_col("s").u32 = {1,2,1,2,1};
+
+    auto tv = t.view();
+    auto r = engine::execute(tv, field_matcher<op::eq,"s",2>{});
+
+    EXPECT_TRUE (simd::test(r.data(),1));
+    EXPECT_TRUE (simd::test(r.data(),3));
+    EXPECT_FALSE(simd::test(r.data(),0));
+}
+
+TEST(Engine, TableViewAggregate) {
+    std::vector<uint32_t> team = std::vector<uint32_t>(1000, 1);
+    std::vector<float> hp(1000, 100.0f);
+    for (size_t i=500;i<1000;++i) { team[i] = 2; hp[i] = 50.0f; }
+
+    table_view<> tv;
+    tv.rows = 1000;
+    tv.cols["team"] = {nullptr, team.data(), nullptr};
+    tv.cols["hp"] = {hp.data(), nullptr, nullptr};
+
+    auto q = field_matcher<op::eq,"team",1>{};
+    EXPECT_DOUBLE_EQ(engine::aggregate(tv, q, "hp", engine::agg::sum), 50000.0);
+    EXPECT_DOUBLE_EQ(engine::aggregate(tv, q, "hp", engine::agg::mean), 100.0);
+}
+
+TEST(Engine, TableViewSemiJoin) {
+    std::vector<uint32_t> user_ids = {0, 1, 2};
+    std::vector<uint32_t> log_uids = {0, 0, 2, 5};
+
+    table_view<> users;
+    users.rows = 3;
+    users.cols["id"] = {nullptr, user_ids.data(), nullptr};
+
+    table_view<> logs;
+    logs.rows = 4;
+    logs.cols["uid"] = {nullptr, log_uids.data(), nullptr};
+
+    auto sj = engine::semi_join(users, field_matcher<op::lt,"id",2>{}, "uid");
+    auto r  = engine::execute(logs, sj);
+    EXPECT_TRUE (simd::test(r.data(),0));
+    EXPECT_TRUE (simd::test(r.data(),1));
+    EXPECT_FALSE(simd::test(r.data(),2));
+}
 
 TEST(Datalog, UnaryBaseNoFilter) {
     auto edges = make_edges({{0,1},{1,2},{2,3}});
@@ -1233,7 +1439,7 @@ TEST(Datalog, FixpointSaturates) {
     datalog::program p;
     p.add_edb("edge", edges, {"src","dst"});
     p.add_idb("reach", 2);
-    p.add_rule({"reach", {"X"}, {{"edge", {"X","D"}}}});
+    p.add_rule({"reach", {"X"}, {{{"edge", {"X","D"}}}}});
     p.add_rule({"reach", {"X"}, {{"reach", {"Y"}}, {"edge", {"Y","X"}}}});
     p.evaluate();
     EXPECT_EQ(popcnt(p.get_bits("reach"), 2), 2u);
@@ -1298,24 +1504,19 @@ TEST(Datalog, ThreeStrata) {
 TEST(Engine, HierarchyDict) {
     table t(4);
     t.add_column_hst("path", {"sensor/temp/1", "sensor/voltage", "motor/rpm", "sensor/temp/2"});
-    // Lexicographical order assigns IDs:
-    // motor/rpm       -> 0
-    // sensor/temp/1   -> 1
-    // sensor/temp/2   -> 2
-    // sensor/voltage  -> 3
-    
+
     auto q1 = field_hst<"path", "sensor">();
     auto r1 = engine::execute(t, q1);
-    EXPECT_FALSE(simd::test(r1.data(), 2)); // motor
-    EXPECT_TRUE(simd::test(r1.data(), 0));  // sensor/temp/1
-    EXPECT_TRUE(simd::test(r1.data(), 3));  // sensor/temp/2
-    EXPECT_TRUE(simd::test(r1.data(), 1));  // sensor/voltage
-    
+    EXPECT_FALSE(simd::test(r1.data(), 2));
+    EXPECT_TRUE(simd::test(r1.data(), 0));
+    EXPECT_TRUE(simd::test(r1.data(), 3));
+    EXPECT_TRUE(simd::test(r1.data(), 1));
+
     auto q2 = field_hst<"path", "sensor/temp">();
     auto r2 = engine::execute(t, q2);
-    EXPECT_TRUE(simd::test(r2.data(), 0));  // sensor/temp/1
-    EXPECT_TRUE(simd::test(r2.data(), 3));  // sensor/temp/2
-    EXPECT_FALSE(simd::test(r2.data(), 1)); // sensor/voltage
+    EXPECT_TRUE(simd::test(r2.data(), 0));
+    EXPECT_TRUE(simd::test(r2.data(), 3));
+    EXPECT_FALSE(simd::test(r2.data(), 1));
 }
 
 TEST(Datalog, PureIDBIntersection) {
@@ -1325,10 +1526,9 @@ TEST(Datalog, PureIDBIntersection) {
     p.add_idb("A", 5); p.add_idb("B", 5); p.add_idb("C", 5);
     p.add_rule({"A", {"X"}, {{"nodes", {"X"}}}, [](const table& t){ return engine::execute(t, field_matcher<op::lt, "id", 4>{}); }, 0});
     p.add_rule({"B", {"X"}, {{"nodes", {"X"}}}, [](const table& t){ return engine::execute(t, field_matcher<op::ge, "id", 2>{}); }, 0});
-    // C(X) :- A(X), B(X)  -> No EDB!
     p.add_rule({"C", {"X"}, {{"A", {"X"}}, {"B", {"X"}}}});
     p.evaluate();
-    
+
     EXPECT_FALSE(bt(p.get_bits("C"), 1));
     EXPECT_TRUE(bt(p.get_bits("C"), 2));
     EXPECT_TRUE(bt(p.get_bits("C"), 3));
@@ -1341,18 +1541,15 @@ TEST(GameECS, ComponentFilter) {
     entities.add_column_u32("level");
     entities.add_column_f32("health");
 
-    // Setup Entity 42: Level 10, Health 25.5, Tag 3 (Poisoned)
     entities.get_col("level").u32[42] = 10;
     entities.get_col("health").f32[42] = 25.5f;
-    entities.set_tag(42, 3); // Bit 3 (value 8)
+    entities.set_tag(42, 3);
 
-    // Setup Entity 43: Level 5, Health 25.5, Tag 3 (Poisoned) - Should fail level check
     entities.get_col("level").u32[43] = 5;
     entities.get_col("health").f32[43] = 25.5f;
     entities.set_tag(43, 3);
 
     using namespace match;
-    // Query: (Level >= 10) AND (Health < 50.0) AND (Has Poison Tag)
     auto query = field_matcher<op::ge, fs("level"), 10u>{} &
                  field_matcher<op::lt, fs("health"), 50.0f>{} &
                  field_matcher<op::eq, fs("mask"), 8ULL>{};
@@ -1367,11 +1564,11 @@ TEST(QuestSystem, QuestChainLogic) {
     const size_t world_size = 100;
     table players(world_size);
     players.add_column_u32("level");
-    players.get_col("level").u32[10] = 15; // Player 10 is high level
+    players.get_col("level").u32[10] = 15;
 
     datalog::program p;
     p.add_edb("player_data", players, {"id", "level"});
-    
+
     p.add_idb("quest_tutorial_done", world_size);
     p.add_idb("quest_boss_unlocked", world_size);
 
@@ -1384,15 +1581,12 @@ TEST(QuestSystem, QuestChainLogic) {
         0
     });
 
-    // 1. Initial state: Player 10 is level 15 but hasn't done tutorial
     p.evaluate();
     EXPECT_FALSE(datalog::bits::test(p.get_bits("quest_boss_unlocked"), 10));
 
-    // 2. Player 10 finishes tutorial
     datalog::bits::set(p.get_bits("quest_tutorial_done"), 10);
     p.evaluate();
-    
-    // 3. Now boss quest should be unlocked
+
     EXPECT_TRUE(datalog::bits::test(p.get_bits("quest_boss_unlocked"), 10));
 }
 
@@ -1438,6 +1632,32 @@ static void BM_Execute(benchmark::State& st) {
 }
 BENCHMARK(BM_Execute)->RangeMultiplier(10)->Range(1000,1000000);
 
+static void BM_ExecuteTableView(benchmark::State& st) {
+    auto owned = bench_table(st.range(0));
+    auto t = owned.view();
+    auto q = field_matcher<op::lt,"id",100>{} & field_matcher<op::eq,"s",1>{};
+    for (auto _:st) benchmark::DoNotOptimize(engine::execute(t,q));
+    st.SetItemsProcessed(st.range(0)*st.iterations());
+}
+BENCHMARK(BM_ExecuteTableView)->RangeMultiplier(10)->Range(1000,1000000);
+
+static void BM_ExecuteExternalMemory(benchmark::State& st) {
+    size_t n = st.range(0);
+    std::vector<uint32_t> ids(n);
+    std::vector<uint32_t> scores(n);
+    for (size_t i=0;i<n;++i) { ids[i] = i; scores[i] = i%3; }
+
+    table_view<> tv;
+    tv.rows = n;
+    tv.cols["id"] = {nullptr, ids.data(), nullptr};
+    tv.cols["s"] = {nullptr, scores.data(), nullptr};
+
+    auto q = field_matcher<op::lt,"id",100>{} & field_matcher<op::eq,"s",1>{};
+    for (auto _:st) benchmark::DoNotOptimize(engine::execute(tv,q));
+    st.SetItemsProcessed(st.range(0)*st.iterations());
+}
+BENCHMARK(BM_ExecuteExternalMemory)->RangeMultiplier(10)->Range(1000,1000000);
+
 static void BM_SemiJoin(benchmark::State& st) {
     auto t = bench_table(st.range(0));
     for (auto _:st) benchmark::DoNotOptimize(engine::semi_join(t,field_matcher<op::lt,"id",500>{},"id"));
@@ -1460,9 +1680,6 @@ static void BM_SemiNaive(benchmark::State& st) {
 }
 BENCHMARK(BM_SemiNaive);
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Datalog Benchmarks
-// ═══════════════════════════════════════════════════════════════════════════════
 static void BM_Datalog_BaseCase(benchmark::State& st) {
     size_t n = st.range(0);
     auto nodes = make_nodes(n);
@@ -1544,7 +1761,7 @@ static void BM_Execute_HST(benchmark::State& st) {
 }
 BENCHMARK(BM_Execute_HST)->RangeMultiplier(10)->Range(1000,1000000);
 
-#define RUN_BENCHMARKS 0
+#define RUN_BENCHMARKS 1
 #if RUN_BENCHMARKS
 BENCHMARK_MAIN();
 #else
