@@ -416,6 +416,11 @@ struct engine {
         {}
     };
 
+    struct incremental_result {
+        mask_t result;
+        size_t evaluated_rows = 0;   // high-water mark
+    };
+
     template<size_t CS>
     static void execute_out(exec_ctx& ctx, const table_view<CS>& t,
                              expr::matcher auto const& matcher) {
@@ -440,6 +445,36 @@ struct engine {
         return std::move(ctx.result);
     }
 
+    template<size_t CS>
+    static mask_t execute_incremental(exec_ctx& ctx,
+                                    incremental_result& ir,
+                                    const table_view<CS>& t,
+                                    expr::matcher auto const& matcher) {
+        if (ir.evaluated_rows >= t.rows)
+            return ir.result;
+
+        size_t num_words = simd::num_words(t.rows);
+        size_t from = ir.evaluated_rows;
+        size_t count = t.rows - from;
+        size_t from_word = from / 64;
+        size_t delta_words = simd::num_words(count);
+
+        if (ir.result.size() < num_words)
+            ir.result.resize(num_words, 0);
+
+        auto query = expr::to_dnf(matcher);
+        uint64_t req = extract_bits(query);
+
+        std::fill_n(ctx.chunk_buf.data(), delta_words, uint64_t{0});
+        eval_from_view(t, query, from, count,
+            ctx.chunk_buf.data(), ctx.scratch.data(), delta_words);
+
+        simd::bor(ir.result.data() + from_word, ctx.chunk_buf.data(), delta_words);
+
+        ir.evaluated_rows = t.rows;
+        return ctx.result;
+    }
+
     static expr::field_in semi_join(const table& t, expr::matcher auto const& q,
                                      std::string_view fk_field) {
         return {fk_field, std::make_shared<mask_t>(execute(t, q))};
@@ -451,6 +486,11 @@ struct engine {
         return {fk_field, std::make_shared<mask_t>(execute(t, q))};
     }
 
+    // This is going to be difficult to do incrementally because of field_in,
+    // which references between tables and invalidating one table requires
+    // re-evaluating the others. Easiest way would be to keep a generation
+    // counter and just invalidate the entire join result when any of the
+    // inputs change.
     static expr::field_in semi_naive_join(const table& t,
                                            expr::matcher auto const& seed,
                                            std::string_view fk_field,

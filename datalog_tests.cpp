@@ -754,6 +754,26 @@ static void BM_ExecuteTableView(benchmark::State& st) {
 }
 BENCHMARK(BM_ExecuteTableView)->RangeMultiplier(10)->Range(1000,1000000);
 
+static void BM_ExecuteExternalMemory_Incremental(benchmark::State& st) {
+    size_t n = st.range(0);
+    std::vector<uint32_t> ids(n);
+    std::vector<uint32_t> scores(n);
+    for (size_t i=0;i<n;++i) { ids[i] = i; scores[i] = i%3; }
+
+    table_view<> tv;
+    tv.rows = n;
+    tv.cols["id"] = {nullptr, ids.data(), nullptr, nullptr};
+    tv.cols["s"] = {nullptr, scores.data(), nullptr, nullptr};
+
+    auto ir = engine::incremental_result{};
+    engine::exec_ctx ctx{n};
+
+    auto q = field_matcher<op::lt,"id",100>{} & field_matcher<op::eq,"s",1>{};
+    for (auto _:st) benchmark::DoNotOptimize(engine::execute_incremental(ctx, ir, tv,q));
+    st.SetItemsProcessed(st.range(0)*st.iterations());
+}
+BENCHMARK(BM_ExecuteExternalMemory_Incremental)->RangeMultiplier(10)->Range(1000,1000000);
+
 static void BM_ExecuteExternalMemory(benchmark::State& st) {
     size_t n = st.range(0);
     std::vector<uint32_t> ids(n);
