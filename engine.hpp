@@ -396,9 +396,56 @@ template<typename M> inline constexpr bool needs_scratch<expr::not_t<M>> = needs
 struct engine {
     using mask_t = simd::mask_t;
 
-    static mask_t execute(const table& t, expr::matcher auto const& m) {
+    static mask_t execute(const table& t, expr::matcher auto const& matcher) {
         const table_view<> tv = t.to_view<>();
-       return execute(tv, m);
+        mask_t result(simd::num_words(t.rows), 0);
+        execute_out(result, tv, matcher);
+        return result;
+    }
+
+    template<size_t CS>
+    static mask_t execute(const table_view<CS>& t, expr::matcher auto const& matcher) {
+        mask_t result(simd::num_words(t.rows), 0);
+        execute_out(result, t, matcher);
+        return result;
+    }
+
+    static void execute_out(mask_t& result, const table& t,
+                        expr::matcher auto const& m) {
+        const table_view<> tv = t.to_view<>();
+        execute_out(result, tv, m);
+    }
+
+    template<size_t CS>
+    static void execute_out(mask_t& result, const table_view<CS>& t,
+                            expr::matcher auto const& matcher) {
+        auto query  = expr::to_dnf(matcher);
+        uint64_t req = extract_bits(query);
+        size_t num_words = simd::num_words(t.rows);
+
+        // Clear out trailing bits
+        std::fill_n(result.data(), num_words, 0);
+
+        if (req == 0 || t.chunk_summaries_empty()) {
+            mask_t scratch(num_words);
+            eval_from_view(t, query, 0, t.rows, result.data(), scratch.data(), num_words);
+        } else {
+            size_t max_cnum_words = simd::num_words(t.chunk_size);
+            mask_t chunk_buf(max_cnum_words);
+            mask_t scratch(max_cnum_words);
+            for (size_t c = 0; c < t.num_chunks(); ++c) {
+                auto& col = t.get_col("mask");
+                uint64_t summary = col.chunk_summaries ? col.chunk_summaries[c] : 0;
+                if ((summary & req) != req) continue;
+                size_t start = c * t.chunk_size;
+                size_t count = std::min(t.chunk_size, t.rows - start);
+                size_t cnum_words = simd::num_words(count);
+                eval_from_view(t, query, start, count,
+                            chunk_buf.data(), scratch.data(), cnum_words);
+                simd::bor(result.data() + start / 64, chunk_buf.data(), cnum_words);
+            }
+        }
+        simd::clear_tail(result.data(), num_words, t.rows);
     }
 
     static expr::field_in semi_join(const table& t, expr::matcher auto const& q,
@@ -410,13 +457,13 @@ struct engine {
                                            expr::matcher auto const& seed,
                                            std::string_view fk_field,
                                            std::string_view id_field = "id") {
-        auto delta = execute(t, seed);
+        mask_t delta = mask_t(simd::num_words(t.rows), 0);
+        execute_out(delta, t, seed);
         auto total = delta;
         size_t num_words = delta.size();
         while (simd::any(delta.data(), num_words)) {
             expr::field_in frontier{fk_field, std::make_shared<mask_t>(delta)};
-            auto reachable = execute(t, frontier);
-            delta = reachable;
+            execute_out(delta, t, frontier);
             simd::bandnot(delta.data(), total.data(), num_words);
             simd::bor(total.data(), delta.data(), num_words);
         }
@@ -433,35 +480,6 @@ struct engine {
         if (!c.u32.empty()) return agg_impl(mask, c.u32, op, t.rows);
         if (!c.u64.empty()) return agg_impl(mask, c.u64, op, t.rows);
         return 0.0;
-    }
-
-    template<size_t CS>
-    static mask_t execute(const table_view<CS>& t, expr::matcher auto const& matcher) {
-        auto query = expr::to_dnf(matcher);
-        uint64_t req = extract_bits(query);
-        size_t num_words = simd::num_words(t.rows);
-        mask_t result(num_words, 0);
-
-        if (req == 0 || t.chunk_summaries_empty()) {
-            mask_t scratch(num_words);
-            eval_from_view(t, query, 0, t.rows, result.data(), scratch.data(), num_words);
-        } else {
-            size_t max_cnum_words = simd::num_words(t.chunk_size);
-            mask_t chunk_buf(max_cnum_words);
-            mask_t scratch(max_cnum_words);
-            for (size_t c = 0; c < t.num_chunks(); ++c) {
-                auto& col = t.get_col("mask");
-                uint64_t summary = col.chunk_summaries ? col.chunk_summaries[c] : 0;
-                if ((summary & req) != req) continue;
-                size_t start = c * t.chunk_size;
-                size_t count = std::min(t.chunk_size, t.rows - start);
-                size_t cnum_words = simd::num_words(count);
-                eval_from_view(t, query, start, count, chunk_buf.data(), scratch.data(), cnum_words);
-                simd::bor(result.data() + start / 64, chunk_buf.data(), cnum_words);
-            }
-        }
-        simd::clear_tail(result.data(), num_words, t.rows);
-        return result;
     }
 
     template<size_t CS>
