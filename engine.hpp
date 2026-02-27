@@ -619,14 +619,32 @@ private:
 
     template<size_t CS>
     static void eval_from_view(const table_view<CS>& t, expr::field_in const& f,
-                               size_t start, size_t count, uint64_t* out, uint64_t*, size_t num_words) {
-        std::fill_n(out, num_words, 0);
+                            size_t start, size_t count, uint64_t* out, uint64_t*, size_t num_words) {
         auto& col = t.get_col(f.field);
-        if (!col.u32) return;
-        auto& bm = *f.bitmap;
-        for (size_t i = 0; i < count; ++i) {
-            uint32_t v = col.u32[start + i];
-            if (v / 64 < bm.size() && simd::test(bm.data(), v)) simd::set(out, i);
+        if (!col.u32) {
+            std::fill_n(out, num_words, 0);
+            return;
+        }
+
+        const uint32_t* ids = col.u32 + start;
+        const uint64_t* bitmap = f.bitmap->data();
+        const size_t bitmap_words = f.bitmap->size();
+
+        for (size_t w = 0; w < num_words; ++w) {
+            uint64_t res = 0;
+            size_t base = w * 64;
+            size_t limit = std::min<size_t>(64, count - base);
+
+            for (size_t b = 0; b < limit; ++b) {
+                uint32_t id = ids[base + b];
+                size_t word_idx = id / 64;
+                
+                if (word_idx < bitmap_words) {
+                    uint64_t bit = (bitmap[word_idx] >> (id % 64)) & 1ULL;
+                    res |= (bit << b);
+                }
+            }
+            out[w] = res;
         }
     }
 };
