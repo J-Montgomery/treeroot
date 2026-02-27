@@ -735,20 +735,3 @@ private:
         }
     }
 };
-
-namespace {
-table make_nodes(size_t n) { return table(n); }
-table make_edges(std::vector<std::pair<uint32_t, uint32_t>> es) {
-    size_t n = es.size(); table t(n);
-    t.add_column_u32("src"); t.add_column_u32("dst");
-    auto& src = t.get_col("src").u32; auto& dst = t.get_col("dst").u32;
-    for (size_t i = 0; i < n; ++i) { src[i] = es[i].first; dst[i] = es[i].second; }
-    return t;
-}
-bool bt(const engine::mask_t& m, size_t i) {
-    return i / 64 < m.size() && (m[i / 64] & (1ULL << (i % 64)));
-}
-size_t popcnt(const engine::mask_t& m, size_t n) {
-    size_t c = 0; for (size_t i = 0; i < n; ++i) c += bt(m, i); return c;
-}
-}

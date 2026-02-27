@@ -11,6 +11,25 @@
 
 using namespace expr;
 
+namespace {
+table make_nodes(size_t n) { return table(n); }
+table make_edges(std::vector<std::pair<uint32_t, uint32_t>> es) {
+    size_t n = es.size(); table t(n);
+    t.add_column_u32("src"); t.add_column_u32("dst");
+    auto& src = t.get_col("src").u32; auto& dst = t.get_col("dst").u32;
+    for (size_t i = 0; i < n; ++i) { src[i] = es[i].first; dst[i] = es[i].second; }
+    return t;
+}
+
+auto count_set_bits = [](const auto& mask, size_t n) {
+    return simd::popcount(mask.data(), simd::num_words(n));
+};
+
+auto bit_at = [](const auto& mask, size_t i) {
+    return simd::test(mask.data(), i);
+};
+}
+
 TEST(Algebra, SubsumptionAndRedundancy) {
     using lt10 = field_matcher<op::lt, "x", 10>;
     using lt20 = field_matcher<op::lt, "x", 20>;
@@ -238,8 +257,8 @@ TEST(Engine, NegativeJoin) {
     table pets(10); pets.add_column_u32("oid");
     for (size_t i=0;i<10;++i) pets.get_col("oid").u32[i] = i;
     auto r = engine::execute(pets, nj);
-    for (size_t i=0;i<5;++i)  EXPECT_TRUE (simd::test(r.data(),i));
-    for (size_t i=5;i<10;++i) EXPECT_FALSE(simd::test(r.data(),i));
+    for (size_t i=0;i<5;++i)  EXPECT_TRUE (bit_at(r,i));
+    for (size_t i=5;i<10;++i) EXPECT_FALSE(bit_at(r,i));
 }
 
 TEST(Engine, TableViewIntegration) {
@@ -253,10 +272,10 @@ TEST(Engine, TableViewIntegration) {
     tv.cols["s"] = {nullptr, scores.data(), nullptr, nullptr};
 
     auto r = engine::execute(tv, field_matcher<op::eq,"s",2>{});
-    EXPECT_FALSE(simd::test(r.data(),0));
-    EXPECT_TRUE (simd::test(r.data(),1));
-    EXPECT_TRUE (simd::test(r.data(),3));
-    EXPECT_FALSE(simd::test(r.data(),4));
+    EXPECT_FALSE(bit_at(r,0));
+    EXPECT_TRUE (bit_at(r,1));
+    EXPECT_TRUE (bit_at(r,3));
+    EXPECT_FALSE(bit_at(r,4));
 }
 
 TEST(Engine, TableViewCompound) {
@@ -270,9 +289,9 @@ TEST(Engine, TableViewCompound) {
 
     auto q = field_matcher<op::lt,"id",40>{} & field_matcher<op::ge,"val",20.0f>{};
     auto r = engine::execute(tv, q);
-    EXPECT_TRUE (simd::test(r.data(),1));
-    EXPECT_TRUE (simd::test(r.data(),2));
-    EXPECT_FALSE(simd::test(r.data(),3));
+    EXPECT_TRUE (bit_at(r,1));
+    EXPECT_TRUE (bit_at(r,2));
+    EXPECT_FALSE(bit_at(r,3));
 }
 
 TEST(Engine, TableToViewConversion) {
@@ -282,9 +301,9 @@ TEST(Engine, TableToViewConversion) {
     auto tv = t.to_view();
     auto r = engine::execute(tv, field_matcher<op::eq,"s",2>{});
 
-    EXPECT_TRUE (simd::test(r.data(),1));
-    EXPECT_TRUE (simd::test(r.data(),3));
-    EXPECT_FALSE(simd::test(r.data(),0));
+    EXPECT_TRUE (bit_at(r,1));
+    EXPECT_TRUE (bit_at(r,3));
+    EXPECT_FALSE(bit_at(r,0));
 }
 
 TEST(Engine, TableViewAggregate) {
@@ -328,10 +347,10 @@ TEST(Datalog, UnaryBaseNoFilter) {
     p.add_idb("r", 4);
     p.add_rule({"r", {"X"}, {{"edge", {"X","D"}}}});
     p.evaluate();
-    EXPECT_TRUE(bt(p.get_bits("r"), 0));
-    EXPECT_TRUE(bt(p.get_bits("r"), 1));
-    EXPECT_TRUE(bt(p.get_bits("r"), 2));
-    EXPECT_FALSE(bt(p.get_bits("r"), 3));
+    EXPECT_TRUE(bit_at(p.get_bits("r"), 0));
+    EXPECT_TRUE(bit_at(p.get_bits("r"), 1));
+    EXPECT_TRUE(bit_at(p.get_bits("r"), 2));
+    EXPECT_FALSE(bit_at(p.get_bits("r"), 3));
 }
 
 TEST(Datalog, UnaryBaseWithFilter) {
@@ -344,10 +363,10 @@ TEST(Datalog, UnaryBaseWithFilter) {
             return engine::execute(t, field_matcher<op::lt, "id", 3>{});
         }, 0});
     p.evaluate();
-    EXPECT_EQ(popcnt(p.get_bits("seed"), 5), 3u);
-    EXPECT_TRUE(bt(p.get_bits("seed"), 0));
-    EXPECT_TRUE(bt(p.get_bits("seed"), 2));
-    EXPECT_FALSE(bt(p.get_bits("seed"), 3));
+    EXPECT_EQ(count_set_bits(p.get_bits("seed"), 5), 3u);
+    EXPECT_TRUE(bit_at(p.get_bits("seed"), 0));
+    EXPECT_TRUE(bit_at(p.get_bits("seed"), 2));
+    EXPECT_FALSE(bit_at(p.get_bits("seed"), 3));
 }
 
 TEST(Datalog, UnaryBaseEmpty) {
@@ -357,7 +376,7 @@ TEST(Datalog, UnaryBaseEmpty) {
     p.add_idb("s", 10);
     p.add_rule({"s", {"X"}, {{"n", {"X"}}}});
     p.evaluate();
-    EXPECT_EQ(popcnt(p.get_bits("s"), 10), 0u);
+    EXPECT_EQ(count_set_bits(p.get_bits("s"), 10), 0u);
 }
 
 TEST(Datalog, UnaryBaseNoMatches) {
@@ -370,7 +389,7 @@ TEST(Datalog, UnaryBaseNoMatches) {
             return engine::execute(t, field_matcher<op::ge, "id", 100>{});
         }, 0});
     p.evaluate();
-    EXPECT_EQ(popcnt(p.get_bits("s"), 3), 0u);
+    EXPECT_EQ(count_set_bits(p.get_bits("s"), 3), 0u);
 }
 
 TEST(Datalog, MultipleRulesSameHead) {
@@ -386,11 +405,11 @@ TEST(Datalog, MultipleRulesSameHead) {
         }, 0});
     p.add_rule({"r", {"X"}, {{"edge", {"X","D"}}}});
     p.evaluate();
-    EXPECT_TRUE(bt(p.get_bits("r"), 0));
-    EXPECT_TRUE(bt(p.get_bits("r"), 1));
-    EXPECT_FALSE(bt(p.get_bits("r"), 2));
-    EXPECT_TRUE(bt(p.get_bits("r"), 3));
-    EXPECT_TRUE(bt(p.get_bits("r"), 4));
+    EXPECT_TRUE(bit_at(p.get_bits("r"), 0));
+    EXPECT_TRUE(bit_at(p.get_bits("r"), 1));
+    EXPECT_FALSE(bit_at(p.get_bits("r"), 2));
+    EXPECT_TRUE(bit_at(p.get_bits("r"), 3));
+    EXPECT_TRUE(bit_at(p.get_bits("r"), 4));
 }
 
 TEST(Datalog, TCLinearChain) {
@@ -402,7 +421,7 @@ TEST(Datalog, TCLinearChain) {
     p.add_rule({"reach", {"X"}, {{"reach", {"Y"}}, {"edge", {"Y","X"}}}});
     p.evaluate();
     for (int i = 0; i <= 4; ++i)
-        EXPECT_TRUE(bt(p.get_bits("reach"), i)) << "missing " << i;
+        EXPECT_TRUE(bit_at(p.get_bits("reach"), i)) << "missing " << i;
 }
 
 TEST(Datalog, TCCycle) {
@@ -413,7 +432,7 @@ TEST(Datalog, TCCycle) {
     p.add_rule({"reach", {"X"}, {{"edge", {"X","D"}}}});
     p.add_rule({"reach", {"X"}, {{"reach", {"Y"}}, {"edge", {"Y","X"}}}});
     p.evaluate();
-    EXPECT_EQ(popcnt(p.get_bits("reach"), 3), 3u);
+    EXPECT_EQ(count_set_bits(p.get_bits("reach"), 3), 3u);
 }
 
 TEST(Datalog, TCDiamond) {
@@ -424,7 +443,7 @@ TEST(Datalog, TCDiamond) {
     p.add_rule({"reach", {"X"}, {{"edge", {"X","D"}}}});
     p.add_rule({"reach", {"X"}, {{"reach", {"Y"}}, {"edge", {"Y","X"}}}});
     p.evaluate();
-    EXPECT_EQ(popcnt(p.get_bits("reach"), 4), 4u);
+    EXPECT_EQ(count_set_bits(p.get_bits("reach"), 4), 4u);
 }
 
 TEST(Datalog, TCDisconnected) {
@@ -435,8 +454,8 @@ TEST(Datalog, TCDisconnected) {
     p.add_rule({"reach", {"X"}, {{"edge", {"X","D"}}}});
     p.add_rule({"reach", {"X"}, {{"reach", {"Y"}}, {"edge", {"Y","X"}}}});
     p.evaluate();
-    for (int i : {0,1,2,5,6,7}) EXPECT_TRUE(bt(p.get_bits("reach"), i)) << i;
-    for (int i : {3,4})         EXPECT_FALSE(bt(p.get_bits("reach"), i)) << i;
+    for (int i : {0,1,2,5,6,7}) EXPECT_TRUE(bit_at(p.get_bits("reach"), i)) << i;
+    for (int i : {3,4})         EXPECT_FALSE(bit_at(p.get_bits("reach"), i)) << i;
 }
 
 TEST(Datalog, TCDeep) {
@@ -449,7 +468,7 @@ TEST(Datalog, TCDeep) {
     p.add_rule({"reach", {"X"}, {{"edge", {"X","D"}}}});
     p.add_rule({"reach", {"X"}, {{"reach", {"Y"}}, {"edge", {"Y","X"}}}});
     p.evaluate();
-    EXPECT_EQ(popcnt(p.get_bits("reach"), 101), 101u);
+    EXPECT_EQ(count_set_bits(p.get_bits("reach"), 101), 101u);
 }
 
 TEST(Datalog, FixpointSaturates) {
@@ -460,7 +479,7 @@ TEST(Datalog, FixpointSaturates) {
     p.add_rule({"reach", {"X"}, {{"edge", {"X","D"}}}});
     p.add_rule({"reach", {"X"}, {{"reach", {"Y"}}, {"edge", {"Y","X"}}}});
     p.evaluate();
-    EXPECT_EQ(popcnt(p.get_bits("reach"), 2), 2u);
+    EXPECT_EQ(count_set_bits(p.get_bits("reach"), 2), 2u);
 }
 
 TEST(Datalog, SimpleNegation) {
@@ -475,11 +494,11 @@ TEST(Datalog, SimpleNegation) {
     p.add_rule({"reach", {"X"}, {{"reach", {"Y"}}, {"edge", {"Y","X"}}}});
     p.add_rule({"unreach", {"X"}, {{"nodes", {"X"}}, {"reach", {"X"}, true}}});
     p.evaluate();
-    for (int i : {0,1,2}) EXPECT_TRUE(bt(p.get_bits("reach"), i));
-    EXPECT_FALSE(bt(p.get_bits("reach"), 3));
-    for (int i : {0,1,2}) EXPECT_FALSE(bt(p.get_bits("unreach"), i));
-    EXPECT_TRUE(bt(p.get_bits("unreach"), 3));
-    EXPECT_TRUE(bt(p.get_bits("unreach"), 4));
+    for (int i : {0,1,2}) EXPECT_TRUE(bit_at(p.get_bits("reach"), i));
+    EXPECT_FALSE(bit_at(p.get_bits("reach"), 3));
+    for (int i : {0,1,2}) EXPECT_FALSE(bit_at(p.get_bits("unreach"), i));
+    EXPECT_TRUE(bit_at(p.get_bits("unreach"), 3));
+    EXPECT_TRUE(bit_at(p.get_bits("unreach"), 4));
 }
 
 TEST(Datalog, NegationAllReachable) {
@@ -494,8 +513,8 @@ TEST(Datalog, NegationAllReachable) {
     p.add_rule({"reach", {"X"}, {{"reach", {"Y"}}, {"edge", {"Y","X"}}}});
     p.add_rule({"unreach", {"X"}, {{"nodes", {"X"}}, {"reach", {"X"}, true}}});
     p.evaluate();
-    EXPECT_EQ(popcnt(p.get_bits("reach"), 3), 3u);
-    EXPECT_EQ(popcnt(p.get_bits("unreach"), 3), 0u);
+    EXPECT_EQ(count_set_bits(p.get_bits("reach"), 3), 3u);
+    EXPECT_EQ(count_set_bits(p.get_bits("unreach"), 3), 0u);
 }
 
 TEST(Datalog, ThreeStrata) {
@@ -512,11 +531,11 @@ TEST(Datalog, ThreeStrata) {
     p.add_rule({"derived", {"X"}, {{"nodes", {"X"}}, {"base", {"X"}, true}}});
     p.add_rule({"fin", {"X"}, {{"nodes", {"X"}}, {"derived", {"X"}, true}}});
     p.evaluate();
-    EXPECT_EQ(popcnt(p.get_bits("base"), 10), 5u);
-    EXPECT_EQ(popcnt(p.get_bits("derived"), 10), 5u);
-    EXPECT_EQ(popcnt(p.get_bits("fin"), 10), 5u);
-    for (int i = 0; i < 5; ++i)  EXPECT_TRUE(bt(p.get_bits("fin"), i));
-    for (int i = 5; i < 10; ++i) EXPECT_FALSE(bt(p.get_bits("fin"), i));
+    EXPECT_EQ(count_set_bits(p.get_bits("base"), 10), 5u);
+    EXPECT_EQ(count_set_bits(p.get_bits("derived"), 10), 5u);
+    EXPECT_EQ(count_set_bits(p.get_bits("fin"), 10), 5u);
+    for (int i = 0; i < 5; ++i)  EXPECT_TRUE(bit_at(p.get_bits("fin"), i));
+    for (int i = 5; i < 10; ++i) EXPECT_FALSE(bit_at(p.get_bits("fin"), i));
 }
 
 TEST(Engine, HierarchyDict) {
@@ -547,10 +566,10 @@ TEST(Datalog, PureIDBIntersection) {
     p.add_rule({"C", {"X"}, {{"A", {"X"}}, {"B", {"X"}}}});
     p.evaluate();
 
-    EXPECT_FALSE(bt(p.get_bits("C"), 1));
-    EXPECT_TRUE(bt(p.get_bits("C"), 2));
-    EXPECT_TRUE(bt(p.get_bits("C"), 3));
-    EXPECT_FALSE(bt(p.get_bits("C"), 4));
+    EXPECT_FALSE(simd::test(p.get_bits("C").data(), 1));
+    EXPECT_TRUE(simd::test(p.get_bits("C").data(), 2));
+    EXPECT_TRUE(simd::test(p.get_bits("C").data(), 3));
+    EXPECT_FALSE(simd::test(p.get_bits("C").data(), 4));
 }
 
 TEST(GameECS, ComponentFilter) {
@@ -659,10 +678,10 @@ TEST(Datalog, RegexPathMatcher) {
 
     p.evaluate();
 
-    EXPECT_TRUE(bt(p.get_bits("S3"), 3));  // 0 reached 3
-    EXPECT_FALSE(bt(p.get_bits("S3"), 12)); // 10 only reached 12 (2 steps)
-    EXPECT_TRUE(bt(p.get_bits("S3"), 23));  // 20 reached 23
-    EXPECT_TRUE(bt(p.get_bits("S3"), 24));  // 20 reached 24 (it's also a valid 3-step end from 21)
+    EXPECT_TRUE(simd::test(p.get_bits("S3").data(), 3));  // 0 reached 3
+    EXPECT_FALSE(simd::test(p.get_bits("S3").data(), 12)); // 10 only reached 12 (2 steps)
+    EXPECT_TRUE(simd::test(p.get_bits("S3").data(), 23));  // 20 reached 23
+    EXPECT_TRUE(simd::test(p.get_bits("S3").data(), 24));  // 20 reached 24 (it's also a valid 3-step end from 21)
 }
 
 TEST(Engine, ManualDFA) {
@@ -1155,7 +1174,7 @@ BENCHMARK(BM_Engine_Manual_DFA)->Range(1000, 100000);
 // }
 // BENCHMARK(BM_Engine_Regex_Optimized)->Range(1000, 100000);
 
-#define RUN_BENCHMARKS 1
+#define RUN_BENCHMARKS 0
 #if RUN_BENCHMARKS
 BENCHMARK_MAIN();
 #else
