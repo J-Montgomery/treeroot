@@ -31,14 +31,26 @@ inline bool any(const uint64_t* a, size_t n) {
 
 template<typename T, typename V, typename Pred>
 void cmp_fill(uint64_t* m, const T* d, V v, size_t n, Pred pred) {
-    size_t nw = num_words(n);
+    const T val = static_cast<T>(v);
+    const size_t nw = n / 64;
+
     for (size_t w = 0; w < nw; ++w) {
-        uint64_t bits = 0;
-        size_t base = w * 64;
-        size_t cnt = std::min<size_t>(64, n - base);
-        for (size_t b = 0; b < cnt; ++b)
-            if (pred(d[base + b], static_cast<T>(v))) bits |= 1ULL << b;
-        m[w] = bits;
+        uint64_t word_bits = 0;
+        const T* chunk = d + (w * 64);
+
+        for (size_t b = 0; b < 64; ++b) {
+            word_bits |= (static_cast<uint64_t>(pred(chunk[b], val)) << b);
+        }
+        m[w] = word_bits;
+    }
+
+    if (size_t tail_count = n % 64) {
+        uint64_t tail_bits = 0;
+        const T* chunk = d + (nw * 64);
+        for (size_t b = 0; b < tail_count; ++b) {
+            tail_bits |= (static_cast<uint64_t>(pred(chunk[b], val)) << b);
+        }
+        m[nw] = tail_bits;
     }
 }
 
