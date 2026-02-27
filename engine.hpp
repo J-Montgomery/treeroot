@@ -283,11 +283,11 @@ struct field_matcher {
 };
 
 template<FixedString Field, FixedString Path>
-struct field_hst {
+struct prefix_matcher {
     using is_matcher = void;
     template<FixedString F2, FixedString P2>
-    friend constexpr bool tag_invoke(expr::implies_t, field_hst const&,
-                                     field_hst<F2,P2> const&) {
+    friend constexpr bool tag_invoke(expr::implies_t, prefix_matcher const&,
+                                     prefix_matcher<F2,P2> const&) {
         if constexpr (!(Field == F2)) return false;
         else return Path.view().starts_with(P2.view());
     }
@@ -600,7 +600,7 @@ private:
     }
 
     template<size_t CS, FixedString Field, FixedString Path>
-    static void eval_from_view(const table_view<CS>& t, field_hst<Field,Path> const&,
+    static void eval_from_view(const table_view<CS>& t, prefix_matcher<Field,Path> const&,
                                size_t start, size_t count, uint64_t* out, uint64_t*, size_t num_words) {
         if (!t.dicts) { std::fill_n(out, num_words, 0); return; }
         auto it = t.dicts->find(std::string(Field.view()));

@@ -80,8 +80,8 @@ TEST(Algebra, OrImpliesM) {
 }
 
 TEST(Algebra, Contrapositive) {
-    using parent = field_hst<"type", "sensor">;
-    using child  = field_hst<"type", "sensor/temp">;
+    using parent = prefix_matcher<"type", "sensor">;
+    using child  = prefix_matcher<"type", "sensor/temp">;
 
     auto neg_parent = !parent{};
     auto neg_child  = !child{};
@@ -120,9 +120,9 @@ TEST(Algebra, DNFTest) {
 }
 
 TEST(Algebra, HST) {
-    using child  = field_hst<"type","sensor/temp">;
-    using parent = field_hst<"type","sensor">;
-    using other  = field_hst<"type","motor">;
+    using child  = prefix_matcher<"type","sensor/temp">;
+    using parent = prefix_matcher<"type","sensor">;
+    using other  = prefix_matcher<"type","motor">;
     static_assert(std::is_same_v<decltype(child{} & parent{}), child>);
     static_assert(is_and_v<decltype(child{} & other{})>);
 }
@@ -542,14 +542,14 @@ TEST(Engine, HierarchyDict) {
     table t(4);
     t.add_column_hst("path", {"sensor/temp/1", "sensor/voltage", "motor/rpm", "sensor/temp/2"});
 
-    auto q1 = field_hst<"path", "sensor">();
+    auto q1 = prefix_matcher<"path", "sensor">();
     auto r1 = engine::execute(t, q1);
     EXPECT_FALSE(simd::test(r1.data(), 2));
     EXPECT_TRUE(simd::test(r1.data(), 0));
     EXPECT_TRUE(simd::test(r1.data(), 3));
     EXPECT_TRUE(simd::test(r1.data(), 1));
 
-    auto q2 = field_hst<"path", "sensor/temp">();
+    auto q2 = prefix_matcher<"path", "sensor/temp">();
     auto r2 = engine::execute(t, q2);
     EXPECT_TRUE(simd::test(r2.data(), 0));
     EXPECT_TRUE(simd::test(r2.data(), 3));
@@ -901,7 +901,7 @@ static void BM_Execute_HST(benchmark::State& st) {
         paths[i] = (i % 2 == 0) ? "sensor/temp/a" : "motor/rpm/b";
     }
     t.add_column_hst("path", paths);
-    auto q = field_hst<"path", "sensor">{};
+    auto q = prefix_matcher<"path", "sensor">{};
     for (auto _:st) benchmark::DoNotOptimize(engine::execute(t,q));
     st.SetItemsProcessed(st.range(0)*st.iterations());
 }
