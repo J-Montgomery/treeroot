@@ -397,29 +397,8 @@ struct engine {
     using mask_t = simd::mask_t;
 
     static mask_t execute(const table& t, expr::matcher auto const& m) {
-        auto sop = expr::to_dnf(m);
-        uint64_t req = extract_bits(sop);
-        size_t nw = simd::num_words(t.rows);
-        mask_t result(nw, 0);
-
-        if (req == 0 || t.chunk_summaries.empty()) {
-            mask_t scratch(nw);
-            eval_into(t, sop, 0, t.rows, result.data(), scratch.data(), nw);
-        } else {
-            size_t max_cnw = simd::num_words(t.chunk_size);
-            mask_t chunk_buf(max_cnw);
-            mask_t scratch(max_cnw);
-            for (size_t c = 0; c < t.num_chunks(); ++c) {
-                if ((t.chunk_summaries[c] & req) != req) continue;
-                size_t start = c * t.chunk_size;
-                size_t count = std::min(t.chunk_size, t.rows - start);
-                size_t cnw = simd::num_words(count);
-                eval_into(t, sop, start, count, chunk_buf.data(), scratch.data(), cnw);
-                simd::bor(result.data() + start / 64, chunk_buf.data(), cnw);
-            }
-        }
-        simd::clear_tail(result.data(), nw, t.rows);
-        return result;
+        const table_view<> tv = t.to_view<>();
+       return execute(tv, m);
     }
 
     static expr::field_in semi_join(const table& t, expr::matcher auto const& q,
@@ -549,90 +528,6 @@ private:
             first = false; ++n;
         }
         return (op == agg::mean && n) ? r / n : r;
-    }
-
-    static void eval_into(const table&, expr::always_t, size_t, size_t count,
-                          uint64_t* out, uint64_t*, size_t nw) {
-        std::fill_n(out, nw, ~0ULL);
-        simd::clear_tail(out, nw, count);
-    }
-    static void eval_into(const table&, expr::never_t, size_t, size_t,
-                          uint64_t* out, uint64_t*, size_t nw) { std::fill_n(out, nw, 0); }
-
-    template<expr::matcher L, expr::matcher R>
-    static void eval_into(const table& t, expr::and_t<L,R> const& a,
-                          size_t s, size_t c, uint64_t* out, uint64_t* scratch, size_t nw) {
-        eval_into(t, a.lhs, s, c, out, scratch, nw);
-        if constexpr (detail::needs_scratch<R>) {
-            mask_t tmp(nw); eval_into(t, a.rhs, s, c, scratch, tmp.data(), nw);
-        } else {
-            eval_into(t, a.rhs, s, c, scratch, nullptr, nw);
-        }
-        simd::band(out, scratch, nw);
-    }
-
-    template<expr::matcher L, expr::matcher R>
-    static void eval_into(const table& t, expr::or_t<L,R> const& o,
-                          size_t s, size_t c, uint64_t* out, uint64_t* scratch, size_t nw) {
-        eval_into(t, o.lhs, s, c, out, scratch, nw);
-        if constexpr (detail::needs_scratch<R>) {
-            mask_t tmp(nw); eval_into(t, o.rhs, s, c, scratch, tmp.data(), nw);
-        } else {
-            eval_into(t, o.rhs, s, c, scratch, nullptr, nw);
-        }
-        simd::bor(out, scratch, nw);
-    }
-
-    template<expr::matcher M>
-    static void eval_into(const table& t, expr::not_t<M> const& n,
-                          size_t s, size_t c, uint64_t* out, uint64_t* scratch, size_t nw) {
-        eval_into(t, n.m, s, c, out, scratch, nw);
-        simd::bnot(out, nw);
-        simd::clear_tail(out, nw, c);
-    }
-
-    template<op O, FixedString Field, auto Val>
-    static void eval_into(const table& t, field_matcher<O,Field,Val> const&,
-                          size_t start, size_t count, uint64_t* out, uint64_t*, size_t nw) {
-        auto& col = t.get_col(Field.view());
-        auto do_cmp = [&]<typename T>(const std::vector<T>& d) {
-            const T* p = d.data() + start;
-            if constexpr (O==op::eq) simd::cmp_eq(out, p, (T)Val, count);
-            if constexpr (O==op::ne) simd::cmp_ne(out, p, (T)Val, count);
-            if constexpr (O==op::lt) simd::cmp_lt(out, p, (T)Val, count);
-            if constexpr (O==op::ge) simd::cmp_ge(out, p, (T)Val, count);
-        };
-        if      (!col.u32.empty()) do_cmp(col.u32);
-        else if (!col.f32.empty()) do_cmp(col.f32);
-        else if (!col.u64.empty()) do_cmp(col.u64);
-        else std::fill_n(out, nw, 0);
-    }
-
-    template<FixedString Field, FixedString Path>
-    static void eval_into(const table& t, field_hst<Field,Path> const&,
-                          size_t start, size_t count, uint64_t* out, uint64_t*, size_t nw) {
-        auto it = t.dicts.find(std::string(Field.view()));
-        if (it == t.dicts.end()) { std::fill_n(out, nw, 0); return; }
-
-        auto [low, high] = it->second.get_prefix_range(Path.view());
-        if (low == high) { std::fill_n(out, nw, 0); return; }
-
-        auto& col = t.get_col(Field.view()).u32;
-        const uint32_t* p = col.data() + start;
-        simd::cmp_fill(out, p, 0, count, [=](uint32_t v, auto) {
-            return v >= low && v < high;
-        });
-    }
-
-    static void eval_into(const table& t, expr::field_in const& f,
-                          size_t start, size_t count, uint64_t* out, uint64_t*, size_t nw) {
-        std::fill_n(out, nw, 0);
-        auto& d = t.get_col(f.field).u32;
-        auto& bm = *f.bitmap;
-        for (size_t i = 0; i < count; ++i) {
-            uint32_t v = d[start + i];
-            if (v / 64 < bm.size() && simd::test(bm.data(), v)) simd::set(out, i);
-        }
     }
 
     template<size_t CS>

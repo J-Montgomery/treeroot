@@ -1174,7 +1174,7 @@ BENCHMARK(BM_Engine_Manual_DFA)->Range(1000, 100000);
 // }
 // BENCHMARK(BM_Engine_Regex_Optimized)->Range(1000, 100000);
 
-#define RUN_BENCHMARKS 0
+#define RUN_BENCHMARKS 1
 #if RUN_BENCHMARKS
 BENCHMARK_MAIN();
 #else
