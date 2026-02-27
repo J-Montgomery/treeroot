@@ -412,13 +412,13 @@ struct engine {
                                            std::string_view id_field = "id") {
         auto delta = execute(t, seed);
         auto total = delta;
-        size_t nw = delta.size();
-        while (simd::any(delta.data(), nw)) {
+        size_t num_words = delta.size();
+        while (simd::any(delta.data(), num_words)) {
             expr::field_in frontier{fk_field, std::make_shared<mask_t>(delta)};
             auto reachable = execute(t, frontier);
             delta = reachable;
-            simd::bandnot(delta.data(), total.data(), nw);
-            simd::bor(total.data(), delta.data(), nw);
+            simd::bandnot(delta.data(), total.data(), num_words);
+            simd::bor(total.data(), delta.data(), num_words);
         }
         return {id_field, std::make_shared<mask_t>(std::move(total))};
     }
@@ -436,31 +436,31 @@ struct engine {
     }
 
     template<size_t CS>
-    static mask_t execute(const table_view<CS>& t, expr::matcher auto const& m) {
-        auto sop = expr::to_dnf(m);
+    static mask_t execute(const table_view<CS>& t, expr::matcher auto const& matcher) {
+        auto sop = expr::to_dnf(matcher);
         uint64_t req = extract_bits(sop);
-        size_t nw = simd::num_words(t.rows);
-        mask_t result(nw, 0);
+        size_t num_words = simd::num_words(t.rows);
+        mask_t result(num_words, 0);
 
         if (req == 0 || t.chunk_summaries_empty()) {
-            mask_t scratch(nw);
-            eval_into_view(t, sop, 0, t.rows, result.data(), scratch.data(), nw);
+            mask_t scratch(num_words);
+            eval_into_view(t, sop, 0, t.rows, result.data(), scratch.data(), num_words);
         } else {
-            size_t max_cnw = simd::num_words(t.chunk_size);
-            mask_t chunk_buf(max_cnw);
-            mask_t scratch(max_cnw);
+            size_t max_cnum_words = simd::num_words(t.chunk_size);
+            mask_t chunk_buf(max_cnum_words);
+            mask_t scratch(max_cnum_words);
             for (size_t c = 0; c < t.num_chunks(); ++c) {
                 auto& col = t.get_col("mask");
                 uint64_t summary = col.chunk_summaries ? col.chunk_summaries[c] : 0;
                 if ((summary & req) != req) continue;
                 size_t start = c * t.chunk_size;
                 size_t count = std::min(t.chunk_size, t.rows - start);
-                size_t cnw = simd::num_words(count);
-                eval_into_view(t, sop, start, count, chunk_buf.data(), scratch.data(), cnw);
-                simd::bor(result.data() + start / 64, chunk_buf.data(), cnw);
+                size_t cnum_words = simd::num_words(count);
+                eval_into_view(t, sop, start, count, chunk_buf.data(), scratch.data(), cnum_words);
+                simd::bor(result.data() + start / 64, chunk_buf.data(), cnum_words);
             }
         }
-        simd::clear_tail(result.data(), nw, t.rows);
+        simd::clear_tail(result.data(), num_words, t.rows);
         return result;
     }
 
@@ -532,52 +532,52 @@ private:
 
     template<size_t CS>
     static void eval_into_view(const table_view<CS>&, expr::always_t, size_t, size_t count,
-                               uint64_t* out, uint64_t*, size_t nw) {
-        std::fill_n(out, nw, ~0ULL);
-        simd::clear_tail(out, nw, count);
+                               uint64_t* out, uint64_t*, size_t num_words) {
+        std::fill_n(out, num_words, ~0ULL);
+        simd::clear_tail(out, num_words, count);
     }
 
     template<size_t CS>
     static void eval_into_view(const table_view<CS>&, expr::never_t, size_t, size_t,
-                               uint64_t* out, uint64_t*, size_t nw) { 
-        std::fill_n(out, nw, 0); 
+                               uint64_t* out, uint64_t*, size_t num_words) { 
+        std::fill_n(out, num_words, 0); 
     }
 
     template<size_t CS, expr::matcher L, expr::matcher R>
     static void eval_into_view(const table_view<CS>& t, expr::and_t<L,R> const& a,
-                               size_t s, size_t c, uint64_t* out, uint64_t* scratch, size_t nw) {
-        eval_into_view(t, a.lhs, s, c, out, scratch, nw);
+                               size_t s, size_t c, uint64_t* out, uint64_t* scratch, size_t num_words) {
+        eval_into_view(t, a.lhs, s, c, out, scratch, num_words);
         if constexpr (detail::needs_scratch<R>) {
-            mask_t tmp(nw); eval_into_view(t, a.rhs, s, c, scratch, tmp.data(), nw);
+            mask_t tmp(num_words); eval_into_view(t, a.rhs, s, c, scratch, tmp.data(), num_words);
         } else {
-            eval_into_view(t, a.rhs, s, c, scratch, nullptr, nw);
+            eval_into_view(t, a.rhs, s, c, scratch, nullptr, num_words);
         }
-        simd::band(out, scratch, nw);
+        simd::band(out, scratch, num_words);
     }
 
     template<size_t CS, expr::matcher L, expr::matcher R>
     static void eval_into_view(const table_view<CS>& t, expr::or_t<L,R> const& o,
-                               size_t s, size_t c, uint64_t* out, uint64_t* scratch, size_t nw) {
-        eval_into_view(t, o.lhs, s, c, out, scratch, nw);
+                               size_t s, size_t c, uint64_t* out, uint64_t* scratch, size_t num_words) {
+        eval_into_view(t, o.lhs, s, c, out, scratch, num_words);
         if constexpr (detail::needs_scratch<R>) {
-            mask_t tmp(nw); eval_into_view(t, o.rhs, s, c, scratch, tmp.data(), nw);
+            mask_t tmp(num_words); eval_into_view(t, o.rhs, s, c, scratch, tmp.data(), num_words);
         } else {
-            eval_into_view(t, o.rhs, s, c, scratch, nullptr, nw);
+            eval_into_view(t, o.rhs, s, c, scratch, nullptr, num_words);
         }
-        simd::bor(out, scratch, nw);
+        simd::bor(out, scratch, num_words);
     }
 
     template<size_t CS, expr::matcher M>
     static void eval_into_view(const table_view<CS>& t, expr::not_t<M> const& n,
-                               size_t s, size_t c, uint64_t* out, uint64_t* scratch, size_t nw) {
-        eval_into_view(t, n.m, s, c, out, scratch, nw);
-        simd::bnot(out, nw);
-        simd::clear_tail(out, nw, c);
+                               size_t s, size_t c, uint64_t* out, uint64_t* scratch, size_t num_words) {
+        eval_into_view(t, n.m, s, c, out, scratch, num_words);
+        simd::bnot(out, num_words);
+        simd::clear_tail(out, num_words, c);
     }
 
     template<size_t CS, op O, FixedString Field, auto Val>
     static void eval_into_view(const table_view<CS>& t, field_matcher<O,Field,Val> const&,
-                               size_t start, size_t count, uint64_t* out, uint64_t*, size_t nw) {
+                               size_t start, size_t count, uint64_t* out, uint64_t*, size_t num_words) {
         auto& col = t.get_col(Field.view());
         if (col.u32) {
             if constexpr (O==op::eq) simd::cmp_eq(out, col.u32 + start, (uint32_t)Val, count);
@@ -595,22 +595,22 @@ private:
             if constexpr (O==op::lt) simd::cmp_lt(out, col.u64 + start, (uint64_t)Val, count);
             if constexpr (O==op::ge) simd::cmp_ge(out, col.u64 + start, (uint64_t)Val, count);
         } else {
-            std::fill_n(out, nw, 0);
+            std::fill_n(out, num_words, 0);
         }
     }
 
     template<size_t CS, FixedString Field, FixedString Path>
     static void eval_into_view(const table_view<CS>& t, field_hst<Field,Path> const&,
-                               size_t start, size_t count, uint64_t* out, uint64_t*, size_t nw) {
-        if (!t.dicts) { std::fill_n(out, nw, 0); return; }
+                               size_t start, size_t count, uint64_t* out, uint64_t*, size_t num_words) {
+        if (!t.dicts) { std::fill_n(out, num_words, 0); return; }
         auto it = t.dicts->find(std::string(Field.view()));
-        if (it == t.dicts->end()) { std::fill_n(out, nw, 0); return; }
+        if (it == t.dicts->end()) { std::fill_n(out, num_words, 0); return; }
 
         auto [low, high] = it->second.get_prefix_range(Path.view());
-        if (low == high) { std::fill_n(out, nw, 0); return; }
+        if (low == high) { std::fill_n(out, num_words, 0); return; }
 
         auto& col = t.get_col(Field.view());
-        if (!col.u32) { std::fill_n(out, nw, 0); return; }
+        if (!col.u32) { std::fill_n(out, num_words, 0); return; }
 
         simd::cmp_fill(out, col.u32 + start, 0, count, [=](uint32_t v, auto) {
             return v >= low && v < high;
@@ -619,8 +619,8 @@ private:
 
     template<size_t CS>
     static void eval_into_view(const table_view<CS>& t, expr::field_in const& f,
-                               size_t start, size_t count, uint64_t* out, uint64_t*, size_t nw) {
-        std::fill_n(out, nw, 0);
+                               size_t start, size_t count, uint64_t* out, uint64_t*, size_t num_words) {
+        std::fill_n(out, num_words, 0);
         auto& col = t.get_col(f.field);
         if (!col.u32) return;
         auto& bm = *f.bitmap;
