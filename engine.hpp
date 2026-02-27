@@ -437,14 +437,14 @@ struct engine {
 
     template<size_t CS>
     static mask_t execute(const table_view<CS>& t, expr::matcher auto const& matcher) {
-        auto sop = expr::to_dnf(matcher);
-        uint64_t req = extract_bits(sop);
+        auto query = expr::to_dnf(matcher);
+        uint64_t req = extract_bits(query);
         size_t num_words = simd::num_words(t.rows);
         mask_t result(num_words, 0);
 
         if (req == 0 || t.chunk_summaries_empty()) {
             mask_t scratch(num_words);
-            eval_into_view(t, sop, 0, t.rows, result.data(), scratch.data(), num_words);
+            eval_from_view(t, query, 0, t.rows, result.data(), scratch.data(), num_words);
         } else {
             size_t max_cnum_words = simd::num_words(t.chunk_size);
             mask_t chunk_buf(max_cnum_words);
@@ -456,7 +456,7 @@ struct engine {
                 size_t start = c * t.chunk_size;
                 size_t count = std::min(t.chunk_size, t.rows - start);
                 size_t cnum_words = simd::num_words(count);
-                eval_into_view(t, sop, start, count, chunk_buf.data(), scratch.data(), cnum_words);
+                eval_from_view(t, query, start, count, chunk_buf.data(), scratch.data(), cnum_words);
                 simd::bor(result.data() + start / 64, chunk_buf.data(), cnum_words);
             }
         }
@@ -531,52 +531,52 @@ private:
     }
 
     template<size_t CS>
-    static void eval_into_view(const table_view<CS>&, expr::always_t, size_t, size_t count,
+    static void eval_from_view(const table_view<CS>&, expr::always_t, size_t, size_t count,
                                uint64_t* out, uint64_t*, size_t num_words) {
         std::fill_n(out, num_words, ~0ULL);
         simd::clear_tail(out, num_words, count);
     }
 
     template<size_t CS>
-    static void eval_into_view(const table_view<CS>&, expr::never_t, size_t, size_t,
+    static void eval_from_view(const table_view<CS>&, expr::never_t, size_t, size_t,
                                uint64_t* out, uint64_t*, size_t num_words) { 
         std::fill_n(out, num_words, 0); 
     }
 
     template<size_t CS, expr::matcher L, expr::matcher R>
-    static void eval_into_view(const table_view<CS>& t, expr::and_t<L,R> const& a,
+    static void eval_from_view(const table_view<CS>& t, expr::and_t<L,R> const& a,
                                size_t s, size_t c, uint64_t* out, uint64_t* scratch, size_t num_words) {
-        eval_into_view(t, a.lhs, s, c, out, scratch, num_words);
+        eval_from_view(t, a.lhs, s, c, out, scratch, num_words);
         if constexpr (detail::needs_scratch<R>) {
-            mask_t tmp(num_words); eval_into_view(t, a.rhs, s, c, scratch, tmp.data(), num_words);
+            mask_t tmp(num_words); eval_from_view(t, a.rhs, s, c, scratch, tmp.data(), num_words);
         } else {
-            eval_into_view(t, a.rhs, s, c, scratch, nullptr, num_words);
+            eval_from_view(t, a.rhs, s, c, scratch, nullptr, num_words);
         }
         simd::band(out, scratch, num_words);
     }
 
     template<size_t CS, expr::matcher L, expr::matcher R>
-    static void eval_into_view(const table_view<CS>& t, expr::or_t<L,R> const& o,
+    static void eval_from_view(const table_view<CS>& t, expr::or_t<L,R> const& o,
                                size_t s, size_t c, uint64_t* out, uint64_t* scratch, size_t num_words) {
-        eval_into_view(t, o.lhs, s, c, out, scratch, num_words);
+        eval_from_view(t, o.lhs, s, c, out, scratch, num_words);
         if constexpr (detail::needs_scratch<R>) {
-            mask_t tmp(num_words); eval_into_view(t, o.rhs, s, c, scratch, tmp.data(), num_words);
+            mask_t tmp(num_words); eval_from_view(t, o.rhs, s, c, scratch, tmp.data(), num_words);
         } else {
-            eval_into_view(t, o.rhs, s, c, scratch, nullptr, num_words);
+            eval_from_view(t, o.rhs, s, c, scratch, nullptr, num_words);
         }
         simd::bor(out, scratch, num_words);
     }
 
     template<size_t CS, expr::matcher M>
-    static void eval_into_view(const table_view<CS>& t, expr::not_t<M> const& n,
+    static void eval_from_view(const table_view<CS>& t, expr::not_t<M> const& n,
                                size_t s, size_t c, uint64_t* out, uint64_t* scratch, size_t num_words) {
-        eval_into_view(t, n.m, s, c, out, scratch, num_words);
+        eval_from_view(t, n.m, s, c, out, scratch, num_words);
         simd::bnot(out, num_words);
         simd::clear_tail(out, num_words, c);
     }
 
     template<size_t CS, op O, FixedString Field, auto Val>
-    static void eval_into_view(const table_view<CS>& t, field_matcher<O,Field,Val> const&,
+    static void eval_from_view(const table_view<CS>& t, field_matcher<O,Field,Val> const&,
                                size_t start, size_t count, uint64_t* out, uint64_t*, size_t num_words) {
         auto& col = t.get_col(Field.view());
         if (col.u32) {
@@ -600,7 +600,7 @@ private:
     }
 
     template<size_t CS, FixedString Field, FixedString Path>
-    static void eval_into_view(const table_view<CS>& t, field_hst<Field,Path> const&,
+    static void eval_from_view(const table_view<CS>& t, field_hst<Field,Path> const&,
                                size_t start, size_t count, uint64_t* out, uint64_t*, size_t num_words) {
         if (!t.dicts) { std::fill_n(out, num_words, 0); return; }
         auto it = t.dicts->find(std::string(Field.view()));
@@ -618,7 +618,7 @@ private:
     }
 
     template<size_t CS>
-    static void eval_into_view(const table_view<CS>& t, expr::field_in const& f,
+    static void eval_from_view(const table_view<CS>& t, expr::field_in const& f,
                                size_t start, size_t count, uint64_t* out, uint64_t*, size_t num_words) {
         std::fill_n(out, num_words, 0);
         auto& col = t.get_col(f.field);
