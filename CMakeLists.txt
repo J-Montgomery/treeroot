@@ -23,6 +23,7 @@ else()
 endif()
 
 find_package(GTest REQUIRED)
+find_package(benchmark REQUIRED)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS True)
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native")
@@ -35,15 +36,12 @@ target_include_directories(treeroot INTERFACE
 add_executable(treeroot_tests
     src/datalog_tests.cpp
 )
-target_link_libraries(treeroot_tests PRIVATE treeroot GTest::GTest GTest::Main benchmark)
+target_link_libraries(treeroot_tests PRIVATE treeroot GTest::GTest GTest::Main)
 
-# add_executable(treeroot_benchmarks
-#     src/datalog_benchmarks.cpp
-# )
-# target_link_libraries(treeroot_benchmarks PRIVATE treeroot benchmark)
+add_executable(treeroot_benchmarks
+    src/datalog_benchmarks.cpp
+)
+target_link_libraries(treeroot_benchmarks PRIVATE treeroot benchmark::benchmark)
 
-# enable_testing()
-# gtest_discover_tests(treeroot_tests)
-
-# enable_benchmarking()
-# add_benchmarks(treeroot_benchmarks)
+enable_testing()
+gtest_discover_tests(treeroot_tests)

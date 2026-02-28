@@ -2,6 +2,7 @@ __pycache__/
 .vscode/
 build/
 bin/
+Testing/
 *.pyc
 combined.md
 matcher
