@@ -29,8 +29,6 @@ class program {
     struct edb_entry { std::string name; const table* tbl; std::vector<std::string> cols; };
     struct idb_entry { std::string name; size_t universe; mask_t mask; };
 
-    friend class batch_program;
-
     std::vector<edb_entry>                  edbs_;
     std::vector<idb_entry>                  idbs_;
     std::vector<rule_def>                   rules_;
