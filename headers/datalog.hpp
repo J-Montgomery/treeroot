@@ -169,8 +169,14 @@ class program {
     }
 
     struct stratum_t {
-        std::vector<size_t> rule_ids;
+        std::vector<size_t> base_rules;
+        std::vector<size_t> rec_rules;
     };
+
+    std::vector<mask_t> accum_;
+    std::vector<mask_t> deltas_;
+    std::vector<size_t> involved_;
+    std::vector<uint8_t> seen_idb_;
 
     std::vector<stratum_t> stratify() {
         std::unordered_map<std::string, int> sn;
@@ -186,8 +192,7 @@ class program {
                     auto it = sn.find(a.rel);
                     if (it == sn.end() || it->second < 0)
                         continue;
-                    req =
-                        std::max(req, a.negated ? it->second + 1 : it->second);
+                    req = std::max(req, a.negated ? it->second + 1 : it->second);
                 }
                 if (req > sn[r.head]) {
                     sn[r.head] = req;
@@ -198,11 +203,16 @@ class program {
         int mx = 0;
         for (auto &[k, s] : sn)
             mx = std::max(mx, s);
+        
         std::vector<stratum_t> res(mx + 1);
         for (size_t i = 0; i < rules_.size(); ++i) {
             int s = sn[rules_[i].head];
-            if (s >= 0)
-                res[s].rule_ids.push_back(i);
+            if (s >= 0) {
+                if (is_recursive(rules_[i]))
+                    res[s].rec_rules.push_back(i);
+                else
+                    res[s].base_rules.push_back(i);
+            }
         }
         return res;
     }
@@ -214,58 +224,76 @@ class program {
         return false;
     }
 
-    void eval_stratum(stratum_t &s) {
-        std::vector<size_t> base, rec;
-        for (size_t ri : s.rule_ids)
-            (is_recursive(rules_[ri]) ? rec : base).push_back(ri);
-
-        for (size_t ri : base) {
+    void eval_stratum(const stratum_t &s) {
+        for (size_t ri : s.base_rules) {
             auto *h = idb(rules_[ri].head);
             fire(ri, nullptr, nullptr, h->mask);
         }
-        if (rec.empty())
+        
+        if (s.rec_rules.empty())
             return;
 
-        std::unordered_set<std::string> involved;
-        for (size_t ri : rec) {
-            involved.insert(rules_[ri].head);
-            for (auto &a : rules_[ri].body)
-                if (!a.negated && idb(a.rel))
-                    involved.insert(a.rel);
+        involved_.clear();
+        for (size_t ri : s.rec_rules) {
+            size_t h_idx = idb_index_[rules_[ri].head];
+            if (!seen_idb_[h_idx]) {
+                seen_idb_[h_idx] = 1;
+                involved_.push_back(h_idx);
+            }
+            for (auto &a : rules_[ri].body) {
+                if (!a.negated) {
+                    auto it = idb_index_.find(a.rel);
+                    if (it != idb_index_.end() && !seen_idb_[it->second]) {
+                        seen_idb_[it->second] = 1;
+                        involved_.push_back(it->second);
+                    }
+                }
+            }
         }
 
-        std::unordered_map<std::string, mask_t> deltas, accum;
-        for (const auto &nm : involved) {
-            auto *p = idb(nm);
-            deltas[nm] = p->mask;
-            accum[nm].assign(p->mask.size(), 0);
+        for (size_t idx : involved_) {
+            deltas_[idx] = idbs_[idx].mask; 
         }
 
         for (bool any_new = true; any_new;) {
             any_new = false;
-            for (auto &[nm, ac] : accum)
-                std::fill(ac.begin(), ac.end(), 0);
+            
+            for (size_t idx : involved_) {
+                std::fill(accum_[idx].begin(), accum_[idx].end(), 0);
+            }
 
-            for (size_t ri : rec) {
+            for (size_t ri : s.rec_rules) {
                 auto &rule = rules_[ri];
+                size_t h_idx = idb_index_[rule.head];
+                
                 for (auto &ba : rule.body) {
-                    if (ba.negated || !idb(ba.rel))
-                        continue;
-                    fire(ri, &ba.rel, &deltas[ba.rel], accum[rule.head]);
+                    if (ba.negated) continue;
+                    
+                    auto it = idb_index_.find(ba.rel);
+                    if (it == idb_index_.end()) continue;
+                    
+                    fire(ri, &ba.rel, &deltas_[it->second], accum_[h_idx]);
                     break;
                 }
             }
 
-            for (const auto &nm : involved) {
-                auto *p = idb(nm);
-                auto &ac = accum[nm];
-                simd::bandnot(ac.data(), p->mask.data(), ac.size());
-                if (simd::any(ac.data(), ac.size())) {
+            for (size_t idx : involved_) {
+                auto &mask = idbs_[idx].mask;
+                auto &ac = accum_[idx];
+                size_t w = ac.size();
+
+                simd::bandnot(ac.data(), mask.data(), w);
+                if (simd::any(ac.data(), w)) {
                     any_new = true;
-                    simd::bor(p->mask.data(), ac.data(), ac.size());
+                    simd::bor(mask.data(), ac.data(), w);
                 }
-                std::swap(deltas[nm], ac);
+                
+                deltas_[idx].swap(ac); 
             }
+        }
+        
+        for (size_t idx : involved_) {
+            seen_idb_[idx] = 0;
         }
     }
 
@@ -289,6 +317,19 @@ class program {
     void evaluate() {
         precompute_filters();
         auto ss = stratify();
+
+        size_t num_idbs = idbs_.size();
+        accum_.resize(num_idbs);
+        deltas_.resize(num_idbs);
+        seen_idb_.assign(num_idbs, 0);
+        involved_.reserve(num_idbs);
+
+        for (size_t i = 0; i < num_idbs; ++i) {
+            size_t words = simd::num_words(idbs_[i].universe);
+            accum_[i].assign(words, 0);
+            deltas_[i].assign(words, 0);
+        }
+
         for (auto &s : ss)
             eval_stratum(s);
     }
