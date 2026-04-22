@@ -9,7 +9,7 @@ project(
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_EXPORT_COMPILE_COMMANDS True)
-find_program(CLANG_FORMAT_EXE NAMES clang-format-22 clang-format)
+find_program(CLANG_FORMAT_EXE NAMES clang-format-18 clang-format)
 
 if(CLANG_FORMAT_EXE)
     file(GLOB_RECURSE ALL_SOURCE_FILES
